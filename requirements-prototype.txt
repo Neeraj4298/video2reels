@@ -1,0 +1,31 @@
+# === Core ML ===
+faster-whisper==1.1.1          # Whisper on CPU/GPU with word timestamps
+av<14                          # PyAV pinned <14 for faster-whisper compatibility
+# whisperx                     # Optional: forced alignment (install separately if needed)
+
+# === LLM ===
+google-genai>=1.0              # Gemini API (new SDK — replaces google-generativeai)
+anthropic>=0.34.0              # Claude API (fallback)
+
+# === Video / Audio ===
+yt-dlp>=2024.10.22             # URL downloading
+moviepy==1.0.3                 # Video metadata helpers (lightweight)
+
+# === ML / Face ===
+mediapipe>=0.10.14             # Face detection for reframing
+opencv-python-headless>=4.10   # Frame extraction (no GUI deps)
+numpy>=1.26                    # Array ops
+scipy>=1.13                    # Kalman filter / signal smoothing
+
+# === NLP ===
+spacy>=3.7                     # Sentence segmentation
+
+# === Utilities ===
+python-dotenv>=1.0             # .env loading
+rich>=13.7                     # Beautiful CLI output
+typer>=0.12                    # CLI argument parsing
+tqdm>=4.66                     # Progress bars
+pydantic>=2.7                  # Data validation / typed models
+loguru>=0.7                    # Structured logging
+pytest>=8.2                    # Stage testing
+pytest-timeout>=2.3            # Test timeouts

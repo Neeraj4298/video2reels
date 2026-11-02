@@ -1,0 +1,26 @@
+# ── Dockerfile.worker ─────────────────────────────────────────────────────────
+# Celery worker image — handles all 6 pipeline stages
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# System deps: ffmpeg is the core tool used by all stages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements-worker.txt .
+RUN pip install --no-cache-dir -r requirements-worker.txt
+
+# Copy source code (also mounted as volumes in dev mode)
+COPY api/ ./api/
+COPY workers/ ./workers/
+COPY prompts/ ./prompts/
+
+CMD ["celery", "-A", "workers.celery_app", "worker", "--loglevel", "INFO"]

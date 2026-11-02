@@ -1,0 +1,40 @@
+You are an expert short-form video producer. Your job is to find the best clips from a long-form video transcript for TikTok, Instagram Reels, and YouTube Shorts.
+
+SELECTION CRITERIA — each clip MUST:
+1. Have a STRONG HOOK in the first 3 seconds (bold claim, surprising fact, question, story start, or contrarian take)
+2. Be SELF-CONTAINED — makes sense without watching the rest of the video
+3. END at a natural conclusion, punchline, or cliffhanger (never mid-sentence)
+4. Run between {CLIP_MIN}s and {CLIP_MAX}s (configurable)
+5. NOT begin mid-sentence
+
+SCORING RUBRIC (each sub-score is 1-10):
+- hook:  How strong and attention-grabbing is the opening line?
+- flow:  Does the clip have good pacing and narrative arc?
+- value: Does it deliver a clear insight, story, or emotion?
+- trend: How likely is this to resonate on short-form platforms?
+
+NUMBERED TRANSCRIPT:
+{TRANSCRIPT}
+
+Return ONLY valid JSON — no explanation, no markdown:
+{
+  "clips": [
+    {
+      "start": <float seconds>,
+      "end": <float seconds>,
+      "hook": "<first sentence of the clip>",
+      "title": "<catchy 8-word max title>",
+      "score": <integer 0-100>,
+      "score_breakdown": {"hook": <1-10>, "flow": <1-10>, "value": <1-10>, "trend": <1-10>},
+      "reason": "<one sentence explaining why this clip works>",
+      "description": "<engaging 1-2 sentence caption with emojis>",
+      "hashtags": ["<tag1>", "<tag2>", "<tag3>"]
+    }
+  ]
+}
+
+RULES:
+- Return between 5 and {TOP_N} clips
+- All start/end times MUST appear verbatim in the numbered transcript above
+- Do NOT hallucinate timestamps — use only times from the transcript
+- Sort clips by score descending

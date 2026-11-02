@@ -1,0 +1,674 @@
+"""
+Stage 5: Smart Vertical Reframing (9:16)
+────────────────────────────────────────
+Converts a landscape clip to 9:16 portrait using active speaker face tracking,
+scene cut detection (PySceneDetect), and smoothed motion paths (Kalman/EMA).
+
+Algorithm:
+  1. Detect scene cuts within the clip using PySceneDetect (prevents panning across cuts).
+  2. Sample frames at ~2–4 fps across each scene.
+  3. Detect faces using MediaPipe BlazeFace (with OpenCV Haar cascade fallback).
+  4. Select primary speaker face (largest area + centered / continuity bias).
+  5. Fallback to center-crop if no face is detected.
+  6. Smooth crop trajectory with deadband, max pan speed limit (e.g. 15%/sec),
+     and EMA smoothing within each scene.
+  7. Generate crop keyframes and dynamic FFmpeg filter expressions.
+  8. Support blur-background (portrait canvas with blurred background) layout option.
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import subprocess
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Optional
+
+import cv2
+import numpy as np
+from loguru import logger
+
+from workers.config import (
+    MODELS_DIR,
+    OUTPUT_HEIGHT,
+    OUTPUT_WIDTH,
+    REFRAME_DEADBAND,
+    REFRAME_DEFAULT_LAYOUT,
+    REFRAME_EMA_ALPHA,
+    REFRAME_MAX_PAN_SPEED,
+    REFRAME_SAMPLE_FPS,
+)
+from workers.ingest import _ffmpeg_bin
+from workers.select_clips import Clip
+
+
+# ── Data Models ───────────────────────────────────────────────────────────────
+
+@dataclass
+class CropKeyframe:
+    frame: int
+    time: float
+    x: int      # left edge of crop window
+    y: int      # top edge of crop window
+    w: int      # crop window width
+    h: int      # crop window height
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CropKeyframe:
+        return cls(
+            frame=int(data.get("frame", 0)),
+            time=float(data.get("time", 0.0)),
+            x=int(data.get("x", 0)),
+            y=int(data.get("y", 0)),
+            w=int(data.get("w", 608)),
+            h=int(data.get("h", 1080)),
+        )
+
+
+@dataclass
+class ReframeResult:
+    clip: Clip
+    video_path: Path
+    keyframes: list[CropKeyframe]
+    crop_w: int
+    crop_h: int
+    layout: str = "vertical"  # "vertical", "blur_bg", "split_screen"
+    out_width: int = OUTPUT_WIDTH
+    out_height: int = OUTPUT_HEIGHT
+    face_in_frame_ratio: float = 1.0
+    crop_filter_expr: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "start": self.clip.start,
+            "end": self.clip.end,
+            "crop_w": self.crop_w,
+            "crop_h": self.crop_h,
+            "layout": self.layout,
+            "out_width": self.out_width,
+            "out_height": self.out_height,
+            "face_in_frame_ratio": round(self.face_in_frame_ratio, 3),
+            "crop_filter_expr": self.crop_filter_expr,
+            "keyframes": [kf.to_dict() for kf in self.keyframes],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], clip: Optional[Clip] = None) -> ReframeResult:
+        c = clip or Clip(
+            start=data.get("start", 0.0),
+            end=data.get("end", 0.0),
+            hook="",
+            title="",
+            score=0,
+            score_breakdown=None,
+            reason="",
+        )
+        keyframes = [CropKeyframe.from_dict(k) for k in data.get("keyframes", [])]
+        return cls(
+            clip=c,
+            video_path=Path(""),
+            keyframes=keyframes,
+            crop_w=int(data.get("crop_w", 608)),
+            crop_h=int(data.get("crop_h", 1080)),
+            layout=str(data.get("layout", "vertical")),
+            out_width=int(data.get("out_width", OUTPUT_WIDTH)),
+            out_height=int(data.get("out_height", OUTPUT_HEIGHT)),
+            face_in_frame_ratio=float(data.get("face_in_frame_ratio", 1.0)),
+            crop_filter_expr=str(data.get("crop_filter_expr", "")),
+        )
+
+
+# ── Crop Window Geometry ──────────────────────────────────────────────────────
+
+def _compute_center_crop(src_w: int, src_h: int) -> tuple[int, int, int, int]:
+    """
+    Compute a centered 9:16 crop window for a given source resolution.
+    Ensures crop dimensions and offsets are even integers.
+    """
+    target_ratio = 9 / 16
+    crop_h = src_h
+    crop_w = int(crop_h * target_ratio)
+
+    if crop_w % 2 != 0:
+        crop_w -= 1
+
+    if crop_w > src_w:
+        crop_w = src_w
+        if crop_w % 2 != 0:
+            crop_w -= 1
+        crop_h = int(crop_w / target_ratio)
+        if crop_h % 2 != 0:
+            crop_h -= 1
+
+    x = (src_w - crop_w) // 2
+    if x % 2 != 0:
+        x -= 1
+    y = (src_h - crop_h) // 2
+    if y % 2 != 0:
+        y -= 1
+    return max(0, x), max(0, y), crop_w, crop_h
+
+
+def _ema_smooth(values: list[float], alpha: float = REFRAME_EMA_ALPHA) -> list[float]:
+    """Exponential moving average smoothing."""
+    if not values:
+        return values
+    smoothed = [values[0]]
+    for v in values[1:]:
+        smoothed.append(alpha * v + (1.0 - alpha) * smoothed[-1])
+    return smoothed
+
+
+# ── Scene Boundary Cut Detection (PySceneDetect) ───────────────────────────────
+
+def detect_scenes(
+    video_path: Path,
+    start_sec: float = 0.0,
+    end_sec: Optional[float] = None,
+    threshold: float = 27.0,
+) -> list[tuple[float, float]]:
+    """
+    Detect scene cuts using PySceneDetect.
+    Returns list of (start_time, end_time) intervals within [start_sec, end_sec].
+    """
+    try:
+        from scenedetect import ContentDetector, detect
+        scene_list = detect(str(video_path), ContentDetector(threshold=threshold))
+        cuts = []
+        for s in scene_list:
+            s_start = s[0].seconds
+            s_end = s[1].seconds
+            # Overlap with [start_sec, end_sec]
+            clip_end = end_sec if end_sec is not None else s_end
+            if s_end > start_sec and s_start < clip_end:
+                cuts.append((max(start_sec, s_start), min(clip_end, s_end)))
+
+        if cuts:
+            return cuts
+    except Exception as exc:
+        logger.debug("[reframe] Scene detection fallback: {}", exc)
+
+    total_end = end_sec if end_sec is not None else (start_sec + 30.0)
+    return [(start_sec, total_end)]
+
+
+# ── Face Detection Engine ─────────────────────────────────────────────────────
+
+class FaceDetectorEngine:
+    """
+    Multi-backend face detector:
+      1. MediaPipe Tasks FaceDetector (BlazeFace short-range)
+      2. OpenCV Haar Cascade (haarcascade_frontalface_default.xml)
+    """
+
+    def __init__(self, models_dir: Path = MODELS_DIR):
+        self.models_dir = Path(models_dir)
+        self._mp_detector = None
+        self._haar_classifier = None
+        self._init_mediapipe()
+        if not self._mp_detector:
+            self._init_haar()
+
+    def _init_mediapipe(self):
+        tflite_path = self.models_dir / "blaze_face_short_range.tflite"
+        if not tflite_path.exists():
+            return
+        try:
+            import mediapipe as mp
+            from mediapipe.tasks.python import vision
+            from mediapipe.tasks.python.core.base_options import BaseOptions
+
+            options = vision.FaceDetectorOptions(
+                base_options=BaseOptions(model_asset_path=str(tflite_path)),
+                min_detection_confidence=0.35,
+            )
+            self._mp_detector = vision.FaceDetector.create_from_options(options)
+            logger.debug("[reframe] MediaPipe FaceDetector initialised")
+        except Exception as exc:
+            logger.warning("[reframe] Could not init MediaPipe FaceDetector: {}", exc)
+            self._mp_detector = None
+
+    def _init_haar(self):
+        haar_path = self.models_dir / "haarcascade_frontalface_default.xml"
+        if not haar_path.exists():
+            return
+        try:
+            clf = cv2.CascadeClassifier(str(haar_path))
+            if not clf.empty():
+                self._haar_classifier = clf
+                logger.debug("[reframe] OpenCV Haar Classifier initialised")
+        except Exception as exc:
+            logger.warning("[reframe] Could not init Haar classifier: {}", exc)
+            self._haar_classifier = None
+
+    def detect(self, bgr_frame: np.ndarray) -> list[dict[str, Any]]:
+        """
+        Detect faces in a BGR OpenCV frame.
+        Returns list of dicts: {x, y, w, h, confidence, center_x, center_y}.
+        """
+        h, w = bgr_frame.shape[:2]
+        faces = []
+
+        # 1. Try MediaPipe
+        if self._mp_detector:
+            try:
+                import mediapipe as mp
+                rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+                mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                results = self._mp_detector.detect(mp_img)
+                if results and results.detections:
+                    for d in results.detections:
+                        bb = d.bounding_box
+                        score = d.categories[0].score if d.categories else 0.5
+                        bx = max(0, bb.origin_x)
+                        by = max(0, bb.origin_y)
+                        bw = min(w - bx, bb.width)
+                        bh = min(h - by, bb.height)
+                        faces.append({
+                            "x": bx, "y": by, "w": bw, "h": bh,
+                            "confidence": float(score),
+                            "center_x": bx + bw / 2.0,
+                            "center_y": by + bh / 2.0,
+                        })
+                    return faces
+            except Exception as exc:
+                logger.debug("[reframe] MediaPipe detect error: {}", exc)
+
+        # 2. Fallback to Haar Cascade
+        if self._haar_classifier:
+            try:
+                gray = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2GRAY)
+                detected = self._haar_classifier.detectMultiScale(
+                    gray, scaleFactor=1.15, minNeighbors=4, minSize=(30, 30)
+                )
+                for (hx, hy, hw, hh) in detected:
+                    faces.append({
+                        "x": int(hx), "y": int(hy), "w": int(hw), "h": int(hh),
+                        "confidence": 0.7,
+                        "center_x": hx + hw / 2.0,
+                        "center_y": hy + hh / 2.0,
+                    })
+                return faces
+            except Exception as exc:
+                logger.debug("[reframe] Haar detect error: {}", exc)
+
+        return faces
+
+    def close(self):
+        if self._mp_detector:
+            try:
+                self._mp_detector.close()
+            except Exception:
+                pass
+            self._mp_detector = None
+
+
+def select_primary_face(
+    faces: list[dict[str, Any]],
+    prev_center_x: Optional[float] = None,
+    src_w: int = 1920,
+) -> Optional[dict[str, Any]]:
+    """
+    Select the primary speaker face among detected candidates.
+    Balances face area (prominence) with distance to previously tracked subject (continuity).
+    """
+    if not faces:
+        return None
+    if len(faces) == 1:
+        return faces[0]
+
+    best_face = None
+    best_score = -1.0
+
+    for f in faces:
+        area = f["w"] * f["h"]
+        cx = f["center_x"]
+
+        # Continuity penalty (if we were already tracking a subject)
+        dist_prev = abs(cx - prev_center_x) / src_w if prev_center_x is not None else 0.0
+        # Centering bias (faces near horizontal center are more likely the main subject)
+        dist_center = abs(cx - (src_w / 2.0)) / src_w
+
+        score = area * (1.0 - 0.35 * dist_prev - 0.15 * dist_center)
+        if score > best_score:
+            best_score = score
+            best_face = f
+
+    return best_face
+
+
+# ── Motion Smoothing & Pan Limiting ───────────────────────────────────────────
+
+def smooth_crop_trajectory(
+    raw_positions: list[dict[str, Any]],
+    scenes: list[tuple[float, float]],
+    src_w: int,
+    crop_w: int,
+    max_pan_speed: float = REFRAME_MAX_PAN_SPEED,
+    deadband_ratio: float = REFRAME_DEADBAND,
+    alpha: float = REFRAME_EMA_ALPHA,
+) -> list[CropKeyframe]:
+    """
+    Enforces deadband, pan speed limiting, and EMA smoothing.
+    At scene cuts, the camera snaps instantly without panning across cuts.
+    """
+    if not raw_positions:
+        return []
+
+    max_x = src_w - crop_w
+    deadband_px = deadband_ratio * src_w
+    smoothed_keyframes: list[CropKeyframe] = []
+
+    # Map timestamps to scene index
+    def get_scene_index(t: float) -> int:
+        for idx, (s_start, s_end) in enumerate(scenes):
+            if s_start <= t <= s_end:
+                return idx
+        return 0
+
+    current_scene = None
+    prev_x = None
+    prev_time = None
+
+    for item in raw_positions:
+        t = item["time"]
+        frame = item["frame"]
+        raw_x = item["target_x"]
+        scene_idx = get_scene_index(t)
+
+        if current_scene != scene_idx or prev_x is None:
+            # Cut or first frame: snap to target immediately
+            smoothed_x = raw_x
+            current_scene = scene_idx
+        else:
+            dt = max(t - prev_time, 1e-4)
+            # 1. Deadband check
+            if abs(raw_x - prev_x) < deadband_px:
+                target_x = prev_x
+            else:
+                target_x = raw_x
+
+            # 2. Max pan speed limiting
+            max_delta = max_pan_speed * src_w * dt
+            delta = target_x - prev_x
+            if abs(delta) > max_delta:
+                target_x = prev_x + math.copysign(max_delta, delta)
+
+            # 3. EMA smoothing
+            smoothed_x = alpha * target_x + (1.0 - alpha) * prev_x
+
+        # Clamp and make even
+        final_x = int(round(smoothed_x))
+        final_x = max(0, min(max_x, final_x))
+        if final_x % 2 != 0:
+            final_x -= 1
+
+        prev_x = float(final_x)
+        prev_time = t
+
+        smoothed_keyframes.append(
+            CropKeyframe(
+                frame=frame,
+                time=t,
+                x=final_x,
+                y=0,
+                w=crop_w,
+                h=item.get("crop_h", 1080),
+            )
+        )
+
+    return smoothed_keyframes
+
+
+# ── FFmpeg Filter Expression Generators ───────────────────────────────────────
+
+def generate_crop_filter_expression(
+    keyframes: list[CropKeyframe],
+    crop_w: int,
+    crop_h: int,
+    src_w: int,
+) -> str:
+    """
+    Generate an FFmpeg crop filter string.
+    - If static: 'crop=w:h:x:y'
+    - If dynamic: generates an interpolated runtime expression evaluated per frame.
+    """
+    if not keyframes:
+        return f"crop={crop_w}:{crop_h}:{(src_w - crop_w)//2}:0"
+
+    x_values = [kf.x for kf in keyframes]
+    # If all keyframes are within 2 pixels, treat as static
+    if max(x_values) - min(x_values) <= 2:
+        return f"crop={crop_w}:{crop_h}:{x_values[0]}:0"
+
+    # Build piecewise linear interpolation in FFmpeg
+    # For each pair (t0, x0) -> (t1, x1):
+    # if(lt(t, t1), x0 + (x1-x0)*(t-t0)/(t1-t0), ...)
+    max_x = src_w - crop_w
+    expr = str(keyframes[-1].x)
+
+    for i in range(len(keyframes) - 2, -1, -1):
+        kf0 = keyframes[i]
+        kf1 = keyframes[i + 1]
+        dt = max(kf1.time - kf0.time, 1e-3)
+        dx = kf1.x - kf0.x
+
+        if abs(dx) < 1:
+            segment = f"{kf0.x}"
+        else:
+            segment = f"({kf0.x}+({dx})*(t-{kf0.time:.2f})/{dt:.2f})"
+
+        expr = f"if(lt(t,{kf1.time:.2f}),{segment},{expr})"
+
+    # Bound within [0, max_x]
+    full_expr = f"clip({expr},0,{max_x})"
+    return f"crop={crop_w}:{crop_h}:x='{full_expr}':y=0"
+
+
+def build_blur_bg_filter_complex(
+    out_w: int = OUTPUT_WIDTH,
+    out_h: int = OUTPUT_HEIGHT,
+    ass_path: Optional[Path | str] = None,
+) -> str:
+    """
+    Build the FFmpeg -filter_complex graph for the blur-background layout.
+    Canvas: 1080×1920 (9:16).
+    Background: blurred and slightly darkened full bleed.
+    Foreground: centered, letterboxed original video with sharp details.
+    """
+    ass_filter = f",ass='{str(ass_path)}'" if ass_path else ""
+    return (
+        f"[0:v]split=2[bg_in][fg_in];"
+        f"[bg_in]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+        f"crop={out_w}:{out_h},boxblur=25:5,eq=brightness=-0.12[bg];"
+        f"[fg_in]scale={out_w}:-2[fg];"
+        f"[bg][fg]overlay=(W-w)/2:(H-h)/2[merged]"
+        + (f";[merged]{ass_filter.lstrip(',')}[out]" if ass_path else ";[merged]copy[out]")
+    )
+
+
+def build_split_screen_filter_complex(
+    out_w: int = OUTPUT_WIDTH,
+    out_h: int = OUTPUT_HEIGHT,
+    ass_path: Optional[Path | str] = None,
+) -> str:
+    """
+    Build the FFmpeg -filter_complex graph for 50/50 vertical split-screen layout.
+    Canvas: 1080×1920 (9:16).
+    Top pane: 1080×960 scaled & cropped view of speaker.
+    Bottom pane: 1080×960 scaled & cropped content.
+    Optionally burned with word-highlight captions.
+    """
+    half_h = out_h // 2
+    ass_filter = f",ass='{str(ass_path)}'" if ass_path else ""
+    return (
+        f"[0:v]split=2[top_in][bot_in];"
+        f"[top_in]scale={out_w}:{half_h}:force_original_aspect_ratio=increase,"
+        f"crop={out_w}:{half_h}[top];"
+        f"[bot_in]scale={out_w}:{half_h}:force_original_aspect_ratio=increase,"
+        f"crop={out_w}:{half_h}[bot];"
+        f"[top][bot]vstack=inputs=2[stacked]"
+        + (f";[stacked]{ass_filter.lstrip(',')}[out]" if ass_path else ";[stacked]copy[out]")
+    )
+
+
+# ── Core Pipeline Function ────────────────────────────────────────────────────
+
+def compute_reframe(
+    clip: Clip,
+    source_video: Path,
+    work_dir: Path,
+    src_w: int,
+    src_h: int,
+    fps: float,
+    layout: str = REFRAME_DEFAULT_LAYOUT,
+    detector: Optional[FaceDetectorEngine] = None,
+) -> ReframeResult:
+    """
+    Stage 5 Main Pipeline:
+      1. Scene boundary detection (PySceneDetect)
+      2. Frame sampling & face detection
+      3. Motion path smoothing with scene cut snapping
+      4. Dynamic crop filter expression generation
+    """
+    center_x, center_y, crop_w, crop_h = _compute_center_crop(src_w, src_h)
+
+    # If layout is blur_bg or split_screen, special filter graph handles framing
+    if layout in ("blur_bg", "split_screen"):
+        keyframes = [CropKeyframe(frame=0, time=0.0, x=0, y=0, w=src_w, h=src_h)]
+        return ReframeResult(
+            clip=clip,
+            video_path=source_video,
+            keyframes=keyframes,
+            crop_w=src_w,
+            crop_h=src_h,
+            layout=layout,
+            out_width=OUTPUT_WIDTH,
+            out_height=OUTPUT_HEIGHT,
+            face_in_frame_ratio=1.0,
+            crop_filter_expr="",
+        )
+
+    # Detect scene boundaries
+    scenes = detect_scenes(source_video, start_sec=clip.start, end_sec=clip.end)
+    logger.debug("[Stage 5] Clip {:.1f}s–{:.1f}s: {} scenes detected", clip.start, clip.end, len(scenes))
+
+    # Initialize face detector
+    engine = detector or FaceDetectorEngine()
+    duration = max(clip.end - clip.start, 0.5)
+    sample_interval = 1.0 / REFRAME_SAMPLE_FPS
+    sample_times = np.arange(0.0, duration, sample_interval).tolist()
+
+    raw_positions = []
+    faces_detected_count = 0
+    cap = cv2.VideoCapture(str(source_video))
+    prev_face_cx = None
+
+    try:
+        for t_rel in sample_times:
+            abs_time = clip.start + t_rel
+            frame_num = int(round(t_rel * fps))
+            cap.set(cv2.CAP_PROP_POS_MSEC, abs_time * 1000.0)
+            ret, frame = cap.read()
+
+            if not ret or frame is None:
+                target_x = center_x
+            else:
+                faces = engine.detect(frame)
+                primary = select_primary_face(faces, prev_center_x=prev_face_cx, src_w=src_w)
+                if primary:
+                    faces_detected_count += 1
+                    prev_face_cx = primary["center_x"]
+                    # Center the crop window around primary face
+                    ideal_x = int(round(primary["center_x"] - (crop_w / 2.0)))
+                    target_x = max(0, min(src_w - crop_w, ideal_x))
+                else:
+                    # Fallback to last known position or center
+                    target_x = int(round(prev_face_cx - (crop_w / 2.0))) if prev_face_cx else center_x
+
+            raw_positions.append({
+                "time": t_rel,
+                "frame": frame_num,
+                "target_x": target_x,
+                "crop_h": crop_h,
+            })
+    finally:
+        cap.release()
+        if not detector:
+            engine.close()
+
+    total_samples = len(sample_times) or 1
+    face_ratio = faces_detected_count / total_samples
+
+    # Smooth the trajectory
+    smoothed_keyframes = smooth_crop_trajectory(
+        raw_positions=raw_positions,
+        scenes=[(s - clip.start, e - clip.start) for (s, e) in scenes],
+        src_w=src_w,
+        crop_w=crop_w,
+    )
+
+    crop_expr = generate_crop_filter_expression(smoothed_keyframes, crop_w, crop_h, src_w)
+    logger.info(
+        "[Stage 5] Clip {:.1f}s–{:.1f}s: face-in-frame {:.1f}%, {} keyframes generated",
+        clip.start, clip.end, face_ratio * 100, len(smoothed_keyframes),
+    )
+
+    return ReframeResult(
+        clip=clip,
+        video_path=source_video,
+        keyframes=smoothed_keyframes,
+        crop_w=crop_w,
+        crop_h=crop_h,
+        layout=layout,
+        out_width=OUTPUT_WIDTH,
+        out_height=OUTPUT_HEIGHT,
+        face_in_frame_ratio=face_ratio,
+        crop_filter_expr=crop_expr,
+    )
+
+
+def reframe_all_clips(
+    clips: list[Clip],
+    source_video: Path,
+    work_dir: Path,
+    src_w: int = 1920,
+    src_h: int = 1080,
+    fps: float = 30.0,
+    layout: str = REFRAME_DEFAULT_LAYOUT,
+) -> list[ReframeResult]:
+    """
+    Compute smart reframe trajectories for all clips in a project.
+    Writes keyframes JSON file and returns ReframeResult list.
+    """
+    detector = FaceDetectorEngine()
+    results = []
+
+    try:
+        for clip in clips:
+            result = compute_reframe(
+                clip=clip,
+                source_video=source_video,
+                work_dir=work_dir,
+                src_w=src_w,
+                src_h=src_h,
+                fps=fps,
+                layout=layout,
+                detector=detector,
+            )
+            results.append(result)
+    finally:
+        detector.close()
+
+    # Save keyframes JSON
+    keyframes_path = work_dir / "clips" / "reframe_keyframes.json"
+    keyframes_path.parent.mkdir(parents=True, exist_ok=True)
+    keyframes_data = [r.to_dict() for r in results]
+    keyframes_path.write_text(json.dumps(keyframes_data, indent=2))
+
+    logger.success("[Stage 5] ✓ Smart reframing computed for {} clips", len(results))
+    return results

@@ -1,0 +1,25 @@
+# === FastAPI Core ===
+fastapi>=0.115.0               # Web framework
+uvicorn[standard]>=0.30        # ASGI server
+pydantic>=2.7                  # Data validation
+pydantic-settings>=2.3         # Settings from env vars
+
+# === Database ===
+sqlalchemy[asyncio]>=2.0.30     # Async ORM (includes greenlet)
+asyncpg>=0.29.0                # PostgreSQL async driver
+psycopg2-binary>=2.9           # PostgreSQL sync driver (Alembic)
+alembic>=1.13                  # DB migrations
+
+# === Object Storage ===
+minio>=7.2.7                   # MinIO / S3 client
+
+# === Task Queue ===
+celery>=5.4                    # Async task queue
+redis>=5.0                     # Redis client (Celery broker + backend)
+kombu>=5.3                     # AMQP/Redis message transport
+
+# === Utilities ===
+python-dotenv>=1.0             # .env loading
+python-multipart>=0.0.9        # Form data and file upload support
+loguru>=0.7                    # Structured logging
+httpx>=0.27                    # Async HTTP client (SSE tests etc.)
