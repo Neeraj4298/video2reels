@@ -18,9 +18,10 @@ celery>=5.4                    # Celery worker
 redis>=5.0                     # Broker + backend
 kombu>=5.3                     # Message transport
 
-# === Database (sync, for worker tasks) ===
+# === Database (sync, for worker tasks + asyncpg for shared api.db import) ===
 sqlalchemy>=2.0.30             # ORM
 psycopg2-binary>=2.9           # PostgreSQL sync driver
+asyncpg>=0.29.0                # PostgreSQL async driver
 
 # === Object Storage ===
 minio>=7.2.7                   # MinIO / S3 client

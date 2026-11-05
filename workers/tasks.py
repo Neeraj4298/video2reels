@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import tempfile
 import time
 import uuid
@@ -22,12 +23,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# Ensure project root (/app) is on sys.path so `import api.*` works in all worker processes
+_ROOT_DIR = str(Path(__file__).resolve().parent.parent)
+if _ROOT_DIR not in sys.path:
+    sys.path.insert(0, _ROOT_DIR)
+
 from celery import chain, group
 from celery.utils.log import get_task_logger
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from workers.celery_app import celery_app
+from workers.celery_app import celery_app, GPU_QUEUE
 
 logger = get_task_logger(__name__)
 
@@ -400,7 +406,12 @@ def stage_ingest(
                 meta = ingest_video(source_input, work_dir)
                 # Store the downloaded video to MinIO so downstream stages have it
                 storage_key = f"{project_id}/video.mp4"
-                downloaded_file = work_dir / "input.mp4"
+                meta_path = getattr(meta, "path", None) if not isinstance(meta, dict) else meta.get("path")
+                downloaded_file = (
+                    Path(meta_path)
+                    if meta_path and Path(meta_path).exists()
+                    else (work_dir / "input.mp4")
+                )
                 if downloaded_file.exists():
                     upload_file(cfg.bucket_originals, storage_key, downloaded_file)
                     video_storage_key = storage_key
@@ -504,7 +515,7 @@ def stage_audio(self, prev: dict) -> dict:
     name="workers.tasks.stage_transcribe",
     bind=True,
     max_retries=3,
-    queue="gpu",
+    queue=GPU_QUEUE,
     acks_late=True,
 )
 def stage_transcribe(self, prev: dict) -> dict:
@@ -669,7 +680,7 @@ def stage_select_clips(self, prev: dict) -> dict:
     name="workers.tasks.stage_reframe",
     bind=True,
     max_retries=3,
-    queue="gpu",
+    queue=GPU_QUEUE,
     acks_late=True,
 )
 def stage_reframe(self, prev: dict) -> dict:
@@ -708,6 +719,8 @@ def stage_reframe(self, prev: dict) -> dict:
     with tempfile.TemporaryDirectory() as tmpdir:
         work_dir = Path(tmpdir)
         try:
+            video_storage_key = prev.get("video_storage_key") or f"{project_id}/video.mp4"
+            video_path = download_file(cfg.bucket_originals, video_storage_key, work_dir / "video.mp4")
             meta = prev.get("meta", {})
             src_w = int(meta.get("width") or 1920)
             src_h = int(meta.get("height") or 1080)
@@ -751,11 +764,13 @@ def stage_reframe(self, prev: dict) -> dict:
     name="workers.tasks.stage_render_all",
     bind=True,
     max_retries=0,
-    queue="gpu",
+    queue=GPU_QUEUE,
     acks_late=True,
 )
 def stage_render_all(self, prev: dict):
     """Dispatch individual render tasks for each clip (parallelized)."""
+    from api.models import JobStatus
+
     project_id = prev["project_id"]
     clip_ids = prev["clip_ids"]
     clips_data = prev["clips_data"]
@@ -781,7 +796,7 @@ def stage_render_all(self, prev: dict):
     name="workers.tasks.stage_render_clip",
     bind=True,
     max_retries=3,
-    queue="gpu",
+    queue=GPU_QUEUE,
     acks_late=True,
 )
 def stage_render_clip(
@@ -852,6 +867,10 @@ def stage_render_clip(
         video_h = (video_rec.height if video_rec else None) or 1080
         video_fps = (video_rec.fps if video_rec else None) or 30.0
         video_codec = (video_rec.codec if video_rec else None) or "h264"
+        video_storage_key = (
+            (video_rec.storage_key if video_rec and video_rec.storage_key else None)
+            or f"{project_id}/video.mp4"
+        )
         saved_crop = rs_rec.crop_keyframes if rs_rec else None
         saved_style = (
             (rs_rec.caption_style if rs_rec else None)
@@ -866,7 +885,7 @@ def stage_render_clip(
         try:
             clip = Clip.from_dict(clip_data)
             video_path = download_file(
-                cfg.bucket_originals, f"{project_id}/video.mp4", work_dir / "video.mp4"
+                cfg.bucket_originals, video_storage_key, work_dir / "video.mp4"
             )
 
             watermark_path = None
@@ -878,7 +897,12 @@ def stage_render_clip(
             transcript = (
                 Transcript.from_dict(transcript_data)
                 if transcript_data
-                else Transcript(language="en", segments=[])
+                else Transcript(
+                    language="en",
+                    language_probability=1.0,
+                    duration=video_duration,
+                    segments=[],
+                )
             )
             style = get_caption_style(saved_style)
 
@@ -905,8 +929,7 @@ def stage_render_clip(
                 fps=video_fps,
                 codec=video_codec,
                 has_audio=True,
-                audio_channels=1,
-                audio_sample_rate=16000,
+                size_bytes=video_path.stat().st_size if video_path.exists() else 0,
             )
 
             # Render the clip via FFmpeg
@@ -999,7 +1022,7 @@ def _check_and_mark_pipeline_complete(project_id: str, total_clips: int):
     name="workers.tasks.render_clip",
     bind=True,
     max_retries=3,
-    queue="gpu",
+    queue=GPU_QUEUE,
     acks_late=True,
 )
 def render_clip(self, project_id: str, clip_id: str, render_settings: dict):
@@ -1030,5 +1053,5 @@ def render_clip(self, project_id: str, clip_id: str, render_settings: dict):
             "reframe_data": render_settings,
             "total_clips": 1,
         },
-        queue="gpu",
+        queue=GPU_QUEUE,
     )

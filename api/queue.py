@@ -4,6 +4,7 @@ Keeps routing logic in one place — tasks are defined in workers/.
 """
 from __future__ import annotations
 
+import os
 import uuid
 
 from workers.celery_app import celery_app
@@ -48,7 +49,7 @@ def dispatch_render(
             "clip_id": str(clip_id),
             "render_settings": render_settings,
         },
-        queue="gpu",
+        queue=os.getenv("GPU_QUEUE", "cpu"),
     )
     return result.id
 

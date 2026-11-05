@@ -16,12 +16,28 @@ _settings = get_settings()
 
 
 def get_client() -> Minio:
-    """Return a cached MinIO client."""
+    """Return a MinIO client for internal API/worker storage operations."""
     return Minio(
         _settings.minio_endpoint,
         access_key=_settings.minio_access_key,
         secret_key=_settings.minio_secret_key,
         secure=_settings.minio_secure,
+    )
+
+
+def _get_presign_client() -> Minio:
+    """
+    Return a MinIO client configured with the browser-reachable endpoint
+    (localhost:9000 instead of internal Docker hostname minio:9000) and
+    explicit region='us-east-1' so presigning works offline without a network call.
+    """
+    public_endpoint = _settings.minio_endpoint.replace("minio:9000", "localhost:9000")
+    return Minio(
+        public_endpoint,
+        access_key=_settings.minio_access_key,
+        secret_key=_settings.minio_secret_key,
+        secure=_settings.minio_secure,
+        region="us-east-1",
     )
 
 
@@ -64,14 +80,14 @@ def download_bytes(bucket: str, key: str) -> bytes:
 def presigned_get_url(bucket: str, key: str, ttl_seconds: int = 3600) -> str:
     """Generate a presigned GET URL (for downloading renders)."""
     from datetime import timedelta
-    client = get_client()
+    client = _get_presign_client()
     return client.presigned_get_object(bucket, key, expires=timedelta(seconds=ttl_seconds))
 
 
 def presigned_put_url(bucket: str, key: str, ttl_seconds: int = 3600) -> str:
     """Generate a presigned PUT URL (for direct browser uploads)."""
     from datetime import timedelta
-    client = get_client()
+    client = _get_presign_client()
     return client.presigned_put_object(bucket, key, expires=timedelta(seconds=ttl_seconds))
 
 

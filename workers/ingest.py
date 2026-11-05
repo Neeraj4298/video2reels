@@ -32,7 +32,7 @@ class VideoMeta:
     fps: float
     has_audio: bool
     codec: str
-    size_bytes: int
+    size_bytes: int = 0
     source_url: Optional[str] = None
 
 
@@ -74,9 +74,17 @@ def download_url(url: str, out_dir: Path) -> Path:
     """Download best quality video+audio from URL using yt-dlp."""
     out_dir.mkdir(parents=True, exist_ok=True)
     template = str(out_dir / "%(title).60s.%(ext)s")
+    ffmpeg_dir = str(Path(_ffmpeg_bin()).resolve().parent)
     cmd = [
         "yt-dlp",
-        "--format", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "--ffmpeg-location", ffmpeg_dir,
+        "--restrict-filenames",
+        "--hls-prefer-native",
+        "--format", (
+            "bestvideo[ext=mp4][vcodec^=avc1][protocol^=http][height<=1080]+bestaudio[ext=m4a][protocol^=http]/"
+            "bestvideo[ext=mp4][protocol^=http][height<=1080]+bestaudio[ext=m4a][protocol^=http]/"
+            "best[ext=mp4]/best"
+        ),
         "--merge-output-format", "mp4",
         "--output", template,
         "--no-playlist",

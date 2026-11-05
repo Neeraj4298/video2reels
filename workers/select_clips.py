@@ -76,6 +76,28 @@ class Clip:
             "hashtags": self.hashtags,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Clip":
+        sb_raw = data.get("score_breakdown") or {}
+        raw_tags = data.get("hashtags") or []
+        tags = [str(h).lstrip("#") for h in raw_tags if str(h).strip()] if isinstance(raw_tags, list) else []
+        return cls(
+            start=float(data.get("start", 0.0)),
+            end=float(data.get("end", 0.0)),
+            hook=str(data.get("hook", "")),
+            title=str(data.get("title", "")),
+            score=int(data.get("score", 50)),
+            score_breakdown=ScoreBreakdown(
+                hook=int(sb_raw.get("hook", 7)),
+                flow=int(sb_raw.get("flow", 7)),
+                value=int(sb_raw.get("value", 7)),
+                trend=int(sb_raw.get("trend", 7)),
+            ),
+            reason=str(data.get("reason", "")),
+            description=str(data.get("description", "")),
+            hashtags=tags,
+        )
+
 
 # ── Pass A: Topic & Turn Segmentation ─────────────────────────────────────────
 
@@ -276,14 +298,20 @@ def _call_gemini(prompt: str) -> str:
     from google.genai import types
 
     client = genai.Client(api_key=GEMINI_API_KEY)
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-        ),
-    )
-    return response.text
+    for model_name in ("gemini-2.5-flash", "gemini-2.0-flash"):
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                ),
+            )
+            return response.text
+        except Exception as exc:
+            if model_name == "gemini-2.0-flash" or "NOT_FOUND" not in str(exc):
+                raise
+    raise RuntimeError("Gemini model call failed")
 
 
 def _call_anthropic(prompt: str) -> str:
@@ -515,6 +543,88 @@ CANDIDATES:
 
 # ── Deduplication ─────────────────────────────────────────────────────────────
 
+def _heuristic_select_clips(
+    transcript: Transcript,
+    user_prompt: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """
+    Fallback clip candidate generator when cloud LLM API keys are missing/invalid.
+    Builds self-contained windows of CLIP_MIN_DURATION..CLIP_MAX_DURATION from
+    transcript segments and ranks them by hook strength, sentiment, and speech energy.
+    """
+    segs = transcript.segments
+    if not segs:
+        return []
+
+    prompt_keywords = set(re.findall(r"\b[a-zA-Z]{3,}\b", (user_prompt or "").lower()))
+    candidates: list[dict[str, Any]] = []
+    n = len(segs)
+    i = 0
+
+    while i < n:
+        start_t = segs[i].start
+        j = i
+        texts: list[str] = []
+        while j < n and (segs[j].end - start_t) < CLIP_MIN_DURATION:
+            texts.append(segs[j].text.strip())
+            j += 1
+
+        # Extend up to target ~45s or sentence boundary under CLIP_MAX_DURATION
+        while j < n and (segs[j].end - start_t) <= min(CLIP_MAX_DURATION, 55):
+            texts.append(segs[j].text.strip())
+            curr_dur = segs[j].end - start_t
+            if curr_dur >= max(CLIP_MIN_DURATION, 30) and re.search(r"[.!?][\"']?$", segs[j].text.strip()):
+                j += 1
+                break
+            j += 1
+
+        end_idx = min(n - 1, max(i, j - 1))
+        end_t = segs[end_idx].end
+        dur = end_t - start_t
+
+        if CLIP_MIN_DURATION <= dur <= CLIP_MAX_DURATION:
+            combined_text = " ".join(t for t in texts if t).strip()
+            first_sentence = re.split(r"(?<=[.!?])\s+", combined_text)[0][:90].strip()
+            words_in_title = re.findall(r"\b[A-Za-z0-9']+\b", first_sentence)[:6]
+            title_str = " ".join(w.capitalize() for w in words_in_title) or f"Highlight {len(candidates) + 1}"
+
+            h_score = compute_hook_score(first_sentence, combined_text[:160])
+            s_score = compute_sentiment_score(combined_text)
+            e_score = compute_energy_score(start_t, end_t, transcript.all_words)
+            base_score = int(round(0.40 * h_score + 0.35 * s_score + 0.25 * e_score))
+
+            if prompt_keywords:
+                lower_text = combined_text.lower()
+                kw_hits = sum(1 for kw in prompt_keywords if kw in lower_text)
+                base_score = min(98, base_score + kw_hits * 8)
+
+            sub_hook = max(5, min(10, int(round(h_score / 10.0))))
+            sub_flow = max(5, min(10, int(round(e_score / 10.0))))
+            sub_val = max(5, min(10, int(round(s_score / 10.0))))
+            sub_trend = max(5, min(10, int(round(base_score / 10.0))))
+
+            candidates.append({
+                "start": round(start_t, 2),
+                "end": round(end_t, 2),
+                "hook": first_sentence or title_str,
+                "title": title_str,
+                "score": base_score,
+                "score_breakdown": {
+                    "hook": sub_hook,
+                    "flow": sub_flow,
+                    "value": sub_val,
+                    "trend": sub_trend,
+                },
+                "reason": "High vocal energy and strong opening statement.",
+                "description": f"{first_sentence} 🔥",
+                "hashtags": ["shorts", "reels", "fyp", "viral", "highlights"],
+            })
+
+        i = max(i + 1, end_idx + 1)
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    return candidates[:TOP_N_CLIPS]
+
 def _remove_overlapping(clips: list[Clip]) -> list[Clip]:
     """Remove overlapping clips, keeping the one with the higher score."""
     clips_sorted = sorted(clips, key=lambda c: c.score, reverse=True)
@@ -610,13 +720,22 @@ def select_clips(
             chunk_idx, len(transcript_chunks), len(prompt),
         )
         t0 = time.time()
-        raw_response = _call_llm(prompt)
-        elapsed = time.time() - t0
-        logger.info("[Stage 4] LLM responded for chunk {}/{} in {:.1f}s", chunk_idx, len(transcript_chunks), elapsed)
-
-        parsed = _extract_json(raw_response)
-        chunk_clips = parsed.get("clips", [])
-        raw_clips.extend(chunk_clips)
+        try:
+            raw_response = _call_llm(prompt)
+            elapsed = time.time() - t0
+            logger.info("[Stage 4] LLM responded for chunk {}/{} in {:.1f}s", chunk_idx, len(transcript_chunks), elapsed)
+            parsed = _extract_json(raw_response)
+            chunk_clips = parsed.get("clips", [])
+            raw_clips.extend(chunk_clips)
+        except ValueError:
+            raise
+        except Exception as llm_exc:
+            logger.warning(
+                "[Stage 4] LLM call failed ({}); using heuristic topic & hook selector fallback",
+                llm_exc,
+            )
+            raw_clips = _heuristic_select_clips(transcript, user_prompt=user_prompt)
+            break
 
     logger.info("[Stage 4] LLM returned {} raw clip candidates", len(raw_clips))
 

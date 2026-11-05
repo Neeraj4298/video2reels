@@ -12,11 +12,19 @@ All tasks have:
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 from celery import Celery
 from kombu import Exchange, Queue
 
+# Ensure project root (/app) is on sys.path so `import api.*` works in all worker processes
+_ROOT_DIR = str(Path(__file__).resolve().parent.parent)
+if _ROOT_DIR not in sys.path:
+    sys.path.insert(0, _ROOT_DIR)
+
 # ── Build broker + backend URLs ───────────────────────────────────────────────
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+GPU_QUEUE = os.getenv("GPU_QUEUE", "cpu")
 
 celery_app = Celery(
     "video2reels",
@@ -42,12 +50,13 @@ celery_app.conf.task_default_queue = "cpu"
 celery_app.conf.task_default_exchange = "default"
 celery_app.conf.task_default_routing_key = "cpu"
 
-# Route GPU-heavy tasks explicitly
+# Route GPU-heavy tasks explicitly (defaults to 'cpu' unless GPU_QUEUE=gpu is set)
 celery_app.conf.task_routes = {
-    "workers.tasks.stage_transcribe":     {"queue": "gpu"},
-    "workers.tasks.stage_reframe":        {"queue": "gpu"},
-    "workers.tasks.stage_render_clip":    {"queue": "gpu"},
-    "workers.tasks.render_clip":          {"queue": "gpu"},
+    "workers.tasks.stage_transcribe":     {"queue": GPU_QUEUE},
+    "workers.tasks.stage_reframe":        {"queue": GPU_QUEUE},
+    "workers.tasks.stage_render_all":     {"queue": GPU_QUEUE},
+    "workers.tasks.stage_render_clip":    {"queue": GPU_QUEUE},
+    "workers.tasks.render_clip":          {"queue": GPU_QUEUE},
 }
 
 # ── Reliability ───────────────────────────────────────────────────────────────
