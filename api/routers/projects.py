@@ -73,7 +73,10 @@ async def create_project(body: ProjectCreate, db: AsyncSession = Depends(get_db)
 
     if body.source_url:
         # URL mode: dispatch pipeline immediately; ingest worker handles yt-dlp
-        dispatch_pipeline(project.id, video_storage_key="")
+        if body.user_prompt:
+            dispatch_pipeline(project.id, video_storage_key="", user_prompt=body.user_prompt)
+        else:
+            dispatch_pipeline(project.id, video_storage_key="")
         project.status = ProjectStatus.processing
 
     return project

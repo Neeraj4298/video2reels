@@ -122,13 +122,23 @@ def _update_project_status(project_id: str, status_val: Any):
     max_retries=0,
     queue="cpu",
 )
-def run_pipeline(self, project_id: str, video_storage_key: str):
+def run_pipeline(
+    self,
+    project_id: str,
+    video_storage_key: str,
+    user_prompt: str | None = None,
+):
     """
     Kick off the full 6-stage pipeline as a Celery chain.
     """
     logger.info("[pipeline] Starting project %s", project_id)
+    ingest_sig = (
+        stage_ingest.s(project_id, video_storage_key, user_prompt=user_prompt)
+        if user_prompt
+        else stage_ingest.s(project_id, video_storage_key)
+    )
     pipeline = chain(
-        stage_ingest.s(project_id, video_storage_key),
+        ingest_sig,
         stage_audio.s(),
         stage_transcribe.s(),
         stage_select_clips.s(),
@@ -336,7 +346,12 @@ def reclip_pipeline(self, project_id: str, user_prompt: str | None = None):
     queue="cpu",
     acks_late=True,
 )
-def stage_ingest(self, project_id: str, video_storage_key: str) -> dict:
+def stage_ingest(
+    self,
+    project_id: str,
+    video_storage_key: str,
+    user_prompt: str | None = None,
+) -> dict:
     """Download/validate the video and update the project record."""
     from api.models import Project, Video, Job, ProjectStatus, JobStatus
     from api.storage import download_file, upload_file
@@ -364,7 +379,10 @@ def stage_ingest(self, project_id: str, video_storage_key: str) -> dict:
             }
             _emit(project_id, "ingest", 20, "Video validated (cached) ✓")
             _update_job_status(project_id, "ingest", JobStatus.running, 20)
-            return {"project_id": project_id, "video_storage_key": video.storage_key or video_storage_key, "meta": meta}
+            out = {"project_id": project_id, "video_storage_key": video.storage_key or video_storage_key, "meta": meta}
+            if user_prompt:
+                out["user_prompt"] = user_prompt
+            return out
 
     with tempfile.TemporaryDirectory() as tmpdir:
         work_dir = Path(tmpdir)
@@ -425,7 +443,10 @@ def stage_ingest(self, project_id: str, video_storage_key: str) -> dict:
 
     _emit(project_id, "ingest", 20, "Video validated ✓")
     _update_job_status(project_id, "ingest", JobStatus.running, 20)
-    return {"project_id": project_id, "video_storage_key": video_storage_key, "meta": meta_dict}
+    out = {"project_id": project_id, "video_storage_key": video_storage_key, "meta": meta_dict}
+    if user_prompt:
+        out["user_prompt"] = user_prompt
+    return out
 
 
 

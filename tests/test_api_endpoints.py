@@ -632,3 +632,48 @@ async def test_brand_kit_logo_upload(client: AsyncClient, test_db: AsyncSession)
         assert f"brand_kits/{kit.id}/logo.png" in data["logo_key"]
         mock_upload.assert_called_once()
 
+
+@pytest.mark.asyncio
+async def test_ui_presigned_upload_and_complete_endpoints(client: AsyncClient):
+    # Create upload project
+    create_res = await client.post("/api/projects", json={"name": "Browser Upload Project"})
+    assert create_res.status_code == 201
+    proj_id = create_res.json()["id"]
+
+    with patch("api.routers.uploads.presigned_put_url", return_value="http://minio:9000/originals/presigned-put"):
+        presign_res = await client.get(
+            f"/api/uploads/presigned?project_id={proj_id}&filename=demo.mp4"
+        )
+        assert presign_res.status_code == 200
+        pdata = presign_res.json()
+        assert pdata["project_id"] == proj_id
+        assert pdata["upload_url"] == "http://minio:9000/originals/presigned-put"
+        storage_key = pdata["storage_key"]
+
+    with patch("api.routers.uploads.object_exists", return_value=True), \
+         patch("api.routers.uploads.dispatch_pipeline") as mock_dispatch:
+        complete_res = await client.post(
+            "/api/uploads/complete",
+            json={"project_id": proj_id, "storage_key": storage_key},
+        )
+        assert complete_res.status_code == 202
+        mock_dispatch.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_create_project_forwards_user_prompt(client: AsyncClient):
+    with patch("api.routers.projects.dispatch_pipeline") as mock_dispatch:
+        mock_dispatch.return_value = "task-prompt-1"
+        res = await client.post(
+            "/api/projects",
+            json={
+                "name": "Prompted URL Project",
+                "source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                "user_prompt": "focus on AI agents and pricing",
+            },
+        )
+        assert res.status_code == 201
+        _, kwargs = mock_dispatch.call_args
+        assert kwargs.get("user_prompt") == "focus on AI agents and pricing"
+
+

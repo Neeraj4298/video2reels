@@ -17,6 +17,9 @@ FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")   # override with ./bin/ffmpeg 
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
+ENABLE_CRITIC_PASS = os.getenv("ENABLE_CRITIC_PASS", "false").lower() in ("1", "true", "yes")
 
 # ── Whisper ───────────────────────────────────────────────────────────────────
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")

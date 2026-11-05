@@ -9,17 +9,24 @@ import uuid
 from workers.celery_app import celery_app
 
 
-def dispatch_pipeline(project_id: uuid.UUID, video_storage_key: str) -> str:
+def dispatch_pipeline(
+    project_id: uuid.UUID,
+    video_storage_key: str,
+    user_prompt: str | None = None,
+) -> str:
     """
     Dispatch the full 6-stage pipeline for a project.
     Returns the Celery task ID of the first stage.
     """
+    kwargs: dict = {
+        "project_id": str(project_id),
+        "video_storage_key": video_storage_key,
+    }
+    if user_prompt:
+        kwargs["user_prompt"] = user_prompt
     result = celery_app.send_task(
         "workers.tasks.run_pipeline",
-        kwargs={
-            "project_id": str(project_id),
-            "video_storage_key": video_storage_key,
-        },
+        kwargs=kwargs,
         queue="cpu",
     )
     return result.id

@@ -72,7 +72,11 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **Prompt-Based Re-Clipping**: Added `user_prompt` support to Stage 4 clip selection (`POST /api/projects/{id}/reclip`) allowing users to extract moments tailored to specific prompts (e.g. "find moments about pricing and revenue").
 - **Batch Export as ZIP**: Added `GET /api/projects/{id}/export/zip` streaming an in-memory ZIP bundle containing all rendered `.mp4` video clips, `.srt` and `.vtt` subtitles, clip `metadata.json`, and `project_summary.json`.
 - **Social Publishing**: Multi-platform publishing scheduler stubs (`POST /api/clips/{id}/publish`) and one-click copy buttons for YouTube Shorts, TikTok, and Instagram Reels formatted captions in the web UI.
-- **Test Suite Expansion**: Test suite expanded from 127 to 134 passing tests (0 failures, 100% pass rate).
+- **Speaker Diarization (`workers/transcribe.py`)**: Acoustic + conversational turn-taking speaker diarization (`diarize_segments`, `diarize_transcript`) assigning `"S1"`, `"S2"`, etc. speaker labels to segments and formatting speaker tags into LLM prompts.
+- **Two-Pass Clip Selection, Blended Virality Scoring, Chunking, Ollama & Critic Pass (`workers/select_clips.py`)**: Pass A topic segmentation (`segment_transcript`), overlapping transcript chunking (`_chunk_transcript_for_llm`), 4-signal blended virality score (`compute_blended_score`), local Ollama LLM support (`_call_ollama`), and optional post-LLM critic pass (`critic_pass`).
+- **1D Kalman Filter Smoothing (`workers/reframe.py`)**: Integrated `KalmanFilter1D` and `_kalman_smooth` with EMA and scene-cut snapping in `smooth_crop_trajectory`.
+- **Direct Upload & Prompt Propagation Fixes (`api/routers/uploads.py`, `api/routers/projects.py`, `workers/tasks.py`)**: Added `GET /api/uploads/presigned` and `POST /api/uploads/complete` endpoints matching the Next.js Web UI flow, and forwarded `user_prompt` end-to-end across the Celery pipeline.
+- **Test Suite Expansion**: Test suite expanded from 127 to 143 passing tests (0 failures, 0 warnings, 100% pass rate).
 
 ---
 

@@ -68,8 +68,8 @@ async def update_clip(
         raise HTTPException(status_code=404, detail="Clip not found")
 
     # Update simple fields
-    for field in ("start", "end", "title", "hook", "selected"):
-        value = getattr(body, field)
+    for field in ("start", "end", "title", "hook", "description", "hashtags", "selected"):
+        value = getattr(body, field, None)
         if value is not None:
             setattr(clip, field, value)
 

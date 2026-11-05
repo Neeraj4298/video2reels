@@ -176,3 +176,70 @@ class TestSelectClipsMocked:
         """Timestamps that don't appear in the transcript should be skipped."""
         clips = select_clips(sample_transcript, tmp_path)
         assert len(clips) == 0, "Clips with timestamps not in transcript should be rejected"
+
+
+# ── Pass A Segmentation, Chunking, Blended Score, Critic & Ollama ────────────
+
+class TestAdvancedSelectionFeatures:
+    def test_pass_a_segment_transcript(self, sample_transcript):
+        from workers.select_clips import segment_transcript
+
+        blocks = segment_transcript(sample_transcript, pause_threshold=0.05, target_block_duration=3.0)
+        assert len(blocks) >= 1
+        assert blocks[0].start == sample_transcript.segments[0].start
+        assert blocks[-1].end == sample_transcript.segments[-1].end
+
+    def test_chunk_transcript_for_llm_overlap(self, sample_transcript):
+        from workers.select_clips import _chunk_transcript_for_llm
+
+        chunks = _chunk_transcript_for_llm(sample_transcript, max_chars=120, overlap_segments=1)
+        assert len(chunks) >= 2
+        assert "[0001]" in chunks[0]
+        assert "[0003]" in chunks[-1]
+
+    def test_blended_virality_score_components(self, sample_transcript):
+        from workers.select_clips import (
+            compute_energy_score,
+            compute_sentiment_score,
+            compute_hook_score,
+            compute_blended_score,
+        )
+
+        energy = compute_energy_score(0.0, 12.9, sample_transcript.all_words)
+        sentiment = compute_sentiment_score("The biggest mistake founders make is insane failure!")
+        hook = compute_hook_score("Why 90% of founders make this biggest mistake?")
+        blended = compute_blended_score(
+            llm_score=85,
+            clip_start=0.0,
+            clip_end=12.9,
+            hook_text="The biggest mistake founders make",
+            transcript=sample_transcript,
+        )
+        assert 0.0 <= energy <= 100.0
+        assert sentiment > 60.0
+        assert hook > 60.0
+        assert 0 <= blended <= 100
+
+    def test_critic_pass_refines_clips(self, sample_transcript):
+        from workers.select_clips import critic_pass
+
+        initial = [_make_clip(0.0, 10.0, score=75), _make_clip(2.0, 12.0, score=72)]
+        critic_reply = json.dumps({
+            "clips": [
+                {
+                    "start": 0.0,
+                    "end": 10.0,
+                    "hook": "Sharpened viral hook",
+                    "title": "Refined Clip",
+                    "score": 92,
+                    "score_breakdown": {"hook": 9, "flow": 9, "value": 9, "trend": 9},
+                    "reason": "Best version kept",
+                }
+            ]
+        })
+        with patch("workers.select_clips._call_llm", return_value=critic_reply):
+            refined = critic_pass(initial, sample_transcript)
+            assert len(refined) == 1
+            assert refined[0].score == 92
+            assert refined[0].hook == "Sharpened viral hook"
+

@@ -104,6 +104,119 @@ class Transcript:
         return [w for s in self.segments for w in s.words]
 
 
+# ── Speaker Diarization ───────────────────────────────────────────────────────
+
+def _extract_segment_audio_features(
+    audio_path: Optional[Path],
+    segments: list[Segment],
+) -> list[tuple[float, float]]:
+    """
+    Extract lightweight acoustic features (normalized ZCR, RMS energy) per segment
+    from a 16kHz mono WAV file if available. Returns empty list if unavailable.
+    """
+    if not audio_path or not Path(audio_path).exists():
+        return []
+    try:
+        import wave
+        import numpy as np
+
+        with wave.open(str(audio_path), "rb") as wf:
+            if wf.getsampwidth() != 2:
+                return []
+            sr = wf.getframerate()
+            n_channels = wf.getnchannels()
+            total_frames = wf.getnframes()
+            raw = wf.readframes(total_frames)
+
+        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+        if n_channels > 1:
+            samples = samples[::n_channels]
+        if len(samples) == 0:
+            return []
+
+        features: list[tuple[float, float]] = []
+        for seg in segments:
+            s_idx = max(0, int(seg.start * sr))
+            e_idx = min(len(samples), int(seg.end * sr))
+            chunk = samples[s_idx:e_idx]
+            if len(chunk) < 160:
+                features.append((0.0, 0.0))
+                continue
+            rms = float(np.sqrt(np.mean(chunk ** 2))) / 32768.0
+            zero_crossings = float(np.mean(np.abs(np.diff(np.signbit(chunk)))))
+            features.append((zero_crossings, rms))
+        return features
+    except Exception:
+        return []
+
+
+def diarize_segments(
+    segments: list[Segment],
+    audio_path: Optional[Path] = None,
+    pause_threshold: float = 1.2,
+    max_speakers: int = 2,
+) -> list[Segment]:
+    """
+    Assign speaker labels ("S1", "S2", ...) to transcript segments.
+    Combines acoustic feature shifts (when WAV audio is available) with
+    conversational turn-taking cues (pauses >= pause_threshold, questions).
+    Preserves any existing non-empty speaker labels if all segments are already labeled.
+    """
+    if not segments:
+        return segments
+
+    if all(seg.speaker is not None for seg in segments):
+        return segments
+
+    features = _extract_segment_audio_features(audio_path, segments)
+    current_speaker_idx = 0
+    num_speakers = max(1, max_speakers)
+
+    for i, seg in enumerate(segments):
+        if i == 0:
+            seg.speaker = seg.speaker or "S1"
+            continue
+
+        prev = segments[i - 1]
+        gap = max(0.0, seg.start - prev.end)
+        prev_text = prev.text.strip()
+
+        # Conversational turn-taking signals
+        long_pause = gap >= pause_threshold
+        question_turn = prev_text.endswith("?") and gap >= 0.35
+
+        # Acoustic feature distance signal (if WAV features extracted)
+        acoustic_shift = False
+        if len(features) == len(segments):
+            zcr_prev, rms_prev = features[i - 1]
+            zcr_curr, rms_curr = features[i]
+            if (zcr_prev > 0 or zcr_curr > 0) and abs(zcr_curr - zcr_prev) > 0.045 and gap >= 0.25:
+                acoustic_shift = True
+
+        if num_speakers > 1 and (long_pause or question_turn or acoustic_shift):
+            current_speaker_idx = (current_speaker_idx + 1) % num_speakers
+
+        seg.speaker = seg.speaker or f"S{current_speaker_idx + 1}"
+
+    return segments
+
+
+def diarize_transcript(
+    transcript: Transcript,
+    audio_path: Optional[Path] = None,
+    pause_threshold: float = 1.2,
+    max_speakers: int = 2,
+) -> Transcript:
+    """Run speaker diarization on a Transcript object in-place and return it."""
+    diarize_segments(
+        transcript.segments,
+        audio_path=audio_path,
+        pause_threshold=pause_threshold,
+        max_speakers=max_speakers,
+    )
+    return transcript
+
+
 # ── Core function ─────────────────────────────────────────────────────────────
 
 def transcribe(audio_path: Path, work_dir: Path) -> Transcript:
@@ -183,6 +296,7 @@ def transcribe(audio_path: Path, work_dir: Path) -> Transcript:
         ))
 
     elapsed = time.time() - t0
+    diarize_segments(segments, audio_path=audio_path)
     transcript = Transcript(
         language=info.language,
         language_probability=round(info.language_probability, 3),

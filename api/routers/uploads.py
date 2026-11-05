@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from api.db import get_db
 from api.models import Job, JobStatus, Project, ProjectStatus, Video
 from api.queue import dispatch_pipeline
+from api.schemas import PresignedUploadResponse
 from api.storage import presigned_put_url, object_exists
 from api.config import get_settings
 
@@ -58,7 +59,36 @@ async def sign_upload(body: SignRequest, db: AsyncSession = Depends(get_db)):
     return SignResponse(upload_url=upload_url, storage_key=storage_key)
 
 
+@router.get("/presigned", response_model=PresignedUploadResponse)
+async def presigned_upload(
+    project_id: uuid.UUID,
+    filename: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    GET endpoint used by the Next.js Web UI to obtain a presigned PUT URL
+    for direct browser-to-MinIO upload.
+    """
+    result = await db.execute(select(Project).where(Project.id == project_id))
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    storage_key = f"{project_id}/{uuid.uuid4()}_{filename}"
+    upload_url = presigned_put_url(
+        _settings.bucket_originals,
+        storage_key,
+        ttl_seconds=3600,
+    )
+    return PresignedUploadResponse(
+        upload_url=upload_url,
+        storage_key=storage_key,
+        project_id=project_id,
+    )
+
+
 @router.post("/confirm", status_code=status.HTTP_202_ACCEPTED)
+@router.post("/complete", status_code=status.HTTP_202_ACCEPTED)
 async def confirm_upload(body: ConfirmRequest, db: AsyncSession = Depends(get_db)):
     """
     Called by the client after a successful direct upload.

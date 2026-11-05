@@ -83,22 +83,25 @@ const STYLE_PRESETS: Record<string, { label: string; icon: string; style: Captio
 
 // ─── Score Breakdown Bar ──────────────────────────────────────────────────────
 function ScoreBar({ label, value }: { label: string; value: number }) {
+  const pct = value <= 10 ? Math.min(100, Math.round(value * 10)) : Math.min(100, Math.round(value));
   const color =
-    value >= 80 ? "var(--green-400)" :
-    value >= 60 ? "var(--amber-400)" :
+    pct >= 80 ? "var(--green-400)" :
+    pct >= 60 ? "var(--amber-400)" :
     "var(--rose-400)";
 
   return (
     <div>
       <div className="flex items-center justify-between mb-1">
         <span style={{ fontSize: "0.8125rem", color: "var(--text-secondary)" }}>{label}</span>
-        <span style={{ fontSize: "0.8125rem", fontFamily: "var(--font-mono)", color }}>{value}</span>
+        <span style={{ fontSize: "0.8125rem", fontFamily: "var(--font-mono)", color }}>
+          {value <= 10 ? `${value}/10` : value}
+        </span>
       </div>
       <div className="progress-track" style={{ height: 4 }}>
         <div
           style={{
             height: "100%",
-            width: `${value}%`,
+            width: `${pct}%`,
             background: color,
             borderRadius: "var(--radius-full)",
             transition: "width 0.8s ease",

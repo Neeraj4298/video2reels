@@ -163,6 +163,57 @@ def _ema_smooth(values: list[float], alpha: float = REFRAME_EMA_ALPHA) -> list[f
     return smoothed
 
 
+class KalmanFilter1D:
+    """
+    1D Kalman Filter for smoothing horizontal camera crop coordinates.
+    Tracks state x (position) with process variance Q and measurement variance R.
+    """
+
+    def __init__(
+        self,
+        initial_value: float = 0.0,
+        process_variance: float = 1e-2,
+        measurement_variance: float = 0.08,
+    ):
+        self.x = float(initial_value)
+        self.p = 1.0
+        self.q = float(process_variance)
+        self.r = float(measurement_variance)
+
+    def reset(self, value: float) -> float:
+        self.x = float(value)
+        self.p = 1.0
+        return self.x
+
+    def update(self, measurement: float) -> float:
+        # Prediction update
+        p_pred = self.p + self.q
+        # Measurement update (Kalman gain)
+        k = p_pred / (p_pred + self.r)
+        self.x = self.x + k * (float(measurement) - self.x)
+        self.p = (1.0 - k) * p_pred
+        return self.x
+
+
+def _kalman_smooth(
+    values: list[float],
+    process_variance: float = 1e-2,
+    measurement_variance: float = 0.08,
+) -> list[float]:
+    """Apply 1D Kalman filter across a sequence of position measurements."""
+    if not values:
+        return values
+    kf = KalmanFilter1D(
+        initial_value=values[0],
+        process_variance=process_variance,
+        measurement_variance=measurement_variance,
+    )
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(kf.update(v))
+    return out
+
+
 # ── Scene Boundary Cut Detection (PySceneDetect) ───────────────────────────────
 
 def detect_scenes(
@@ -373,6 +424,7 @@ def smooth_crop_trajectory(
     current_scene = None
     prev_x = None
     prev_time = None
+    kalman = KalmanFilter1D()
 
     for item in raw_positions:
         t = item["time"]
@@ -381,8 +433,8 @@ def smooth_crop_trajectory(
         scene_idx = get_scene_index(t)
 
         if current_scene != scene_idx or prev_x is None:
-            # Cut or first frame: snap to target immediately
-            smoothed_x = raw_x
+            # Cut or first frame: snap to target immediately and reset Kalman state
+            smoothed_x = kalman.reset(raw_x)
             current_scene = scene_idx
         else:
             dt = max(t - prev_time, 1e-4)
@@ -398,8 +450,9 @@ def smooth_crop_trajectory(
             if abs(delta) > max_delta:
                 target_x = prev_x + math.copysign(max_delta, delta)
 
-            # 3. EMA smoothing
-            smoothed_x = alpha * target_x + (1.0 - alpha) * prev_x
+            # 3. Kalman + EMA smoothing
+            kalman_x = kalman.update(target_x)
+            smoothed_x = alpha * kalman_x + (1.0 - alpha) * prev_x
 
         # Clamp and make even
         final_x = int(round(smoothed_x))

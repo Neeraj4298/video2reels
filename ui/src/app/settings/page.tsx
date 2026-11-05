@@ -170,6 +170,7 @@ export default function SettingsPage() {
                 >
                   <option value="vertical">Vertical (face-tracked crop)</option>
                   <option value="blur_bg">Blur Background (letterbox)</option>
+                  <option value="split_screen">Split Screen (50/50 vertical stack)</option>
                 </select>
               </div>
             </div>
@@ -181,11 +182,11 @@ export default function SettingsPage() {
               <h3 style={{ marginBottom: "var(--space-4)" }}>About</h3>
               <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "var(--space-2) var(--space-6)", fontSize: "0.875rem" }}>
                 {[
-                  ["Version", "v1.0.0 (Phase 3)"],
+                  ["Version", "v2.0.0 (Phase 5)"],
                   ["Backend", "FastAPI + Celery + PostgreSQL"],
-                  ["AI Models", "Gemini 2.0 Flash (clip selection) · Faster-Whisper (transcription)"],
-                  ["Reframing", "MediaPipe BlazeFace · PySceneDetect · EMA smoothing"],
-                  ["Export", "FFmpeg H.264 1080×1920 @ 30fps"],
+                  ["AI Models", "Gemini 2.0 Flash / Claude / Ollama · Faster-Whisper + Diarization"],
+                  ["Reframing", "MediaPipe BlazeFace · PySceneDetect · Kalman + EMA smoothing"],
+                  ["Export", "FFmpeg H.264 1080×1920 @ 30fps + Brand Kit Watermark"],
                 ].map(([label, value]) => (
                   <>
                     <span key={`l-${label}`} style={{ color: "var(--text-muted)", fontWeight: 500 }}>{label}</span>

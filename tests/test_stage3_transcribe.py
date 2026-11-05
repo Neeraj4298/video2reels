@@ -62,3 +62,33 @@ class TestTranscribeCaching:
 
         assert result.language == sample_transcript.language
         assert len(result.segments) == len(sample_transcript.segments)
+
+
+class TestSpeakerDiarization:
+    def test_diarize_segments_assigns_speakers_on_pause_and_question(self):
+        from workers.transcribe import diarize_segments
+
+        segs = [
+            Segment(start=0.0, end=3.0, text="What is the biggest challenge in scaling?"),
+            Segment(start=3.6, end=8.0, text="Hiring the right engineering team early on."),
+            Segment(start=8.2, end=12.0, text="And keeping the product vision focused."),
+            Segment(start=14.0, end=17.5, text="That makes total sense."),
+        ]
+        diarized = diarize_segments(segs, pause_threshold=1.2, max_speakers=2)
+        assert diarized[0].speaker == "S1"
+        # After question + 0.6s gap -> S2
+        assert diarized[1].speaker == "S2"
+        # Continuation with 0.2s gap -> stays S2
+        assert diarized[2].speaker == "S2"
+        # After 2.0s pause (>= 1.2s) -> switches back to S1
+        assert diarized[3].speaker == "S1"
+
+    def test_diarize_transcript_round_trip_preserves_speaker(self, sample_transcript):
+        from workers.transcribe import diarize_transcript
+
+        t = diarize_transcript(sample_transcript)
+        for seg in t.segments:
+            assert seg.speaker in ("S1", "S2")
+        restored = Transcript.from_dict(t.to_dict())
+        assert [s.speaker for s in restored.segments] == [s.speaker for s in t.segments]
+

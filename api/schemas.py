@@ -66,6 +66,8 @@ class ClipUpdate(BaseModel):
     end: float | None = None
     title: str | None = None
     hook: str | None = None
+    description: str | None = None
+    hashtags: list[str] | None = None
     selected: bool | None = None
     caption_style: dict | None = None
 

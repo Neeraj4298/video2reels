@@ -15,14 +15,16 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+import urllib.request
 
 from loguru import logger
 from workers.config import (
     LLM_PROVIDER, GEMINI_API_KEY, ANTHROPIC_API_KEY,
+    OLLAMA_BASE_URL, OLLAMA_MODEL, ENABLE_CRITIC_PASS,
     CLIP_MIN_DURATION, CLIP_MAX_DURATION, TOP_N_CLIPS,
 )
-from workers.transcribe import Transcript, Word
+from workers.transcribe import Transcript, Segment, Word
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
@@ -75,27 +77,162 @@ class Clip:
         }
 
 
-# ── Transcript formatting ─────────────────────────────────────────────────────
+# ── Pass A: Topic & Turn Segmentation ─────────────────────────────────────────
+
+@dataclass
+class TopicSegment:
+    start: float
+    end: float
+    text: str
+    speaker: Optional[str] = None
+    segment_indices: list[int] = field(default_factory=list)
+
+    @property
+    def duration(self) -> float:
+        return self.end - self.start
+
+
+def segment_transcript(
+    transcript: Transcript,
+    pause_threshold: float = 1.5,
+    target_block_duration: float = 45.0,
+) -> list[TopicSegment]:
+    """
+    Pass A — Segmentation:
+    Split transcript into coherent topic blocks at:
+      - Sentence boundaries (. ! ?) when target duration is reached
+      - Long pauses (> pause_threshold seconds of silence)
+      - Speaker changes (e.g., S1 -> S2)
+    """
+    if not transcript.segments:
+        return []
+
+    blocks: list[TopicSegment] = []
+    curr_segs: list[tuple[int, Segment]] = []
+
+    for idx, seg in enumerate(transcript.segments, 1):
+        if not curr_segs:
+            curr_segs.append((idx, seg))
+            continue
+
+        prev_idx, prev_seg = curr_segs[-1]
+        block_start = curr_segs[0][1].start
+        block_dur = prev_seg.end - block_start
+        pause_gap = max(0.0, seg.start - prev_seg.end)
+        speaker_changed = (
+            bool(seg.speaker and prev_seg.speaker)
+            and seg.speaker != prev_seg.speaker
+        )
+        sentence_end = bool(re.search(r"[.!?][\"']?$", prev_seg.text.strip()))
+
+        should_split = (
+            pause_gap >= pause_threshold
+            or (speaker_changed and block_dur >= 10.0)
+            or (sentence_end and block_dur >= target_block_duration)
+        )
+
+        if should_split:
+            blocks.append(
+                TopicSegment(
+                    start=curr_segs[0][1].start,
+                    end=prev_seg.end,
+                    text=" ".join(s.text.strip() for _, s in curr_segs),
+                    speaker=curr_segs[0][1].speaker,
+                    segment_indices=[i for i, _ in curr_segs],
+                )
+            )
+            curr_segs = [(idx, seg)]
+        else:
+            curr_segs.append((idx, seg))
+
+    if curr_segs:
+        blocks.append(
+            TopicSegment(
+                start=curr_segs[0][1].start,
+                end=curr_segs[-1][1].end,
+                text=" ".join(s.text.strip() for _, s in curr_segs),
+                speaker=curr_segs[0][1].speaker,
+                segment_indices=[i for i, _ in curr_segs],
+            )
+        )
+
+    return blocks
+
+
+# ── Transcript formatting & chunking ──────────────────────────────────────────
+
+def _format_segment_line(index: int, seg: Segment) -> str:
+    speaker_prefix = f"({seg.speaker}) " if seg.speaker else ""
+    return f"[{index:04d}] {seg.start:.2f}s–{seg.end:.2f}s: {speaker_prefix}{seg.text.strip()}"
+
 
 def _format_transcript_for_llm(transcript: Transcript, max_chars: int = 80_000) -> str:
     """
     Format transcript as numbered, timestamped lines for LLM consumption.
     Keeps lines short to avoid overwhelming the context window.
     """
-    lines = []
-    for i, seg in enumerate(transcript.segments, 1):
-        lines.append(f"[{i:04d}] {seg.start:.2f}s–{seg.end:.2f}s: {seg.text.strip()}")
+    lines = [
+        _format_segment_line(i, seg)
+        for i, seg in enumerate(transcript.segments, 1)
+    ]
 
     text = "\n".join(lines)
     if len(text) > max_chars:
-        # Truncate with warning — split into chunks in v2
         logger.warning(
-            "Transcript too long ({} chars), truncating to {}. "
-            "Some content may be missed.",
+            "Transcript too long ({} chars), truncating single window to {}.",
             len(text), max_chars,
         )
         text = text[:max_chars]
     return text
+
+
+def _chunk_transcript_for_llm(
+    transcript: Transcript,
+    max_chars: int = 80_000,
+    overlap_segments: int = 5,
+) -> list[str]:
+    """
+    Split a long transcript into overlapping formatted text chunks so multi-hour
+    videos are processed without losing tail content.
+    """
+    lines = [
+        _format_segment_line(i, seg)
+        for i, seg in enumerate(transcript.segments, 1)
+    ]
+    if not lines:
+        return [""]
+
+    full_text = "\n".join(lines)
+    if len(full_text) <= max_chars:
+        return [full_text]
+
+    chunks: list[str] = []
+    n = len(lines)
+    start_idx = 0
+
+    while start_idx < n:
+        curr_lines: list[str] = []
+        curr_len = 0
+        idx = start_idx
+
+        while idx < n:
+            line = lines[idx]
+            add_len = len(line) + (1 if curr_lines else 0)
+            if curr_lines and curr_len + add_len > max_chars:
+                break
+            curr_lines.append(line)
+            curr_len += add_len
+            idx += 1
+
+        chunks.append("\n".join(curr_lines))
+        if idx >= n:
+            break
+
+        # Advance with overlap
+        next_start = max(start_idx + 1, idx - max(0, overlap_segments))
+        start_idx = next_start
+
+    return chunks
 
 
 # ── Word-boundary snapping ────────────────────────────────────────────────────
@@ -160,6 +297,26 @@ def _call_anthropic(prompt: str) -> str:
     return message.content[0].text
 
 
+def _call_ollama(prompt: str) -> str:
+    """Call local Ollama HTTP API (/api/generate) in JSON mode."""
+    url = f"{OLLAMA_BASE_URL.rstrip('/')}/api/generate"
+    payload = json.dumps({
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "format": "json",
+        "stream": False,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+        return body.get("response", "{}")
+
+
 def _call_llm(prompt: str) -> str:
     """Dispatch to the configured LLM provider."""
     provider = LLM_PROVIDER.lower()
@@ -168,8 +325,10 @@ def _call_llm(prompt: str) -> str:
         return _call_gemini(prompt)
     elif provider == "anthropic":
         return _call_anthropic(prompt)
+    elif provider == "ollama":
+        return _call_ollama(prompt)
     else:
-        raise ValueError(f"Unknown LLM_PROVIDER: {provider}. Use gemini or anthropic.")
+        raise ValueError(f"Unknown LLM_PROVIDER: {provider}. Use gemini, anthropic, or ollama.")
 
 
 # ── JSON extraction ───────────────────────────────────────────────────────────
@@ -186,6 +345,172 @@ def _extract_json(raw: str) -> dict:
         if match:
             return json.loads(match.group())
         raise ValueError(f"Could not parse LLM JSON output: {e}\nRaw:\n{raw[:500]}")
+
+
+# ── Blended Virality Scoring (BUILD_ARCHITECTURE.md §7 & §9) ─────────────────
+
+_HOOK_PATTERNS = [
+    r"\b(?:biggest|number one|#1|worst|best|secret|mistake|truth|never|always|stop|why|how)\b",
+    r"\b\d+(?:\s*%|\s*x|\s*million|\s*billion|\s*reasons|\s*steps|\s*ways|\s*things)\b",
+    r"\b(?:nobody tells you|here(?:'s| is) the thing|unpopular opinion|most people|if you want)\b",
+    r"\?",
+]
+
+_SENTIMENT_INTENSITY_WORDS = {
+    "amazing", "insane", "incredible", "shocking", "massive", "critical", "crucial",
+    "mistake", "fail", "failed", "failure", "million", "billion", "secret", "breakthrough",
+    "never", "always", "obsessed", "love", "hate", "terrifying", "genius", "wrong",
+    "guaranteed", "instantly", "powerful", "proven", "exact", "urgent", "warning",
+}
+
+
+def compute_energy_score(clip_start: float, clip_end: float, all_words: list[Word]) -> float:
+    """
+    Compute speech pace & vocal confidence energy score (0–100) for a clip window.
+    """
+    duration = max(1.0, clip_end - clip_start)
+    clip_words = [w for w in all_words if clip_start <= w.start <= clip_end]
+    if not clip_words:
+        return 65.0
+
+    wpm = (len(clip_words) / duration) * 60.0
+    if 130 <= wpm <= 195:
+        pace_score = 90.0
+    elif 100 <= wpm < 130:
+        pace_score = 70.0 + ((wpm - 100.0) / 30.0) * 20.0
+    elif 195 < wpm <= 240:
+        pace_score = 90.0 - ((wpm - 195.0) / 45.0) * 20.0
+    else:
+        pace_score = max(45.0, min(70.0, (wpm / 130.0) * 70.0))
+
+    avg_conf = sum(w.probability for w in clip_words) / len(clip_words)
+    conf_score = max(50.0, min(100.0, avg_conf * 100.0))
+    return round(0.65 * pace_score + 0.35 * conf_score, 2)
+
+
+def compute_sentiment_score(text: str) -> float:
+    """
+    Compute emotional intensity / sentiment arousal score (0–100) from clip text.
+    """
+    if not text or not text.strip():
+        return 60.0
+
+    words = re.findall(r"\b[a-zA-Z']+\b", text.lower())
+    if not words:
+        return 60.0
+
+    hits = sum(1 for w in words if w in _SENTIMENT_INTENSITY_WORDS)
+    exclamations = text.count("!") + text.count("?")
+    density = (hits + 0.5 * exclamations) / max(10, len(words))
+    score = 60.0 + min(40.0, density * 350.0)
+    return round(max(0.0, min(100.0, score)), 2)
+
+
+def compute_hook_score(hook_text: str, opening_text: str = "") -> float:
+    """
+    Rule-based hook pattern score (0–100) inspecting the clip's hook and first 5s.
+    """
+    combined = f"{hook_text} {opening_text}".strip().lower()
+    if not combined:
+        return 55.0
+
+    matches = sum(1 for pat in _HOOK_PATTERNS if re.search(pat, combined, re.IGNORECASE))
+    score = 60.0 + min(40.0, matches * 14.0)
+    return round(max(0.0, min(100.0, score)), 2)
+
+
+def compute_blended_score(
+    llm_score: float,
+    clip_start: float,
+    clip_end: float,
+    hook_text: str,
+    transcript: Transcript,
+) -> int:
+    """
+    Combine LLM virality score with speech energy, emotional sentiment, and hook pattern:
+        final_score = (
+            llm_score       * 0.60 +
+            energy_score    * 0.15 +
+            sentiment_score * 0.15 +
+            hook_score      * 0.10
+        )
+    """
+    all_words = transcript.all_words
+    clip_words = [w for w in all_words if clip_start <= w.start <= clip_end]
+    clip_text = " ".join(w.text.strip() for w in clip_words)
+    opening_words = [w for w in clip_words if w.start <= clip_start + 5.0]
+    opening_text = " ".join(w.text.strip() for w in opening_words)
+
+    energy = compute_energy_score(clip_start, clip_end, all_words)
+    sentiment = compute_sentiment_score(clip_text or hook_text)
+    hook = compute_hook_score(hook_text, opening_text)
+
+    blended = (
+        float(llm_score) * 0.60
+        + energy * 0.15
+        + sentiment * 0.15
+        + hook * 0.10
+    )
+    return int(max(0, min(100, round(blended))))
+
+
+# ── Post-LLM Critic Pass (v2) ─────────────────────────────────────────────────
+
+def critic_pass(clips: list[Clip], transcript: Transcript) -> list[Clip]:
+    """
+    Second-pass LLM review that evaluates candidate clips for thematic uniqueness,
+    stronger hook phrasing, and score refinement. Falls back gracefully on error.
+    """
+    if len(clips) <= 1:
+        return clips
+
+    candidates_payload = [c.to_dict() for c in clips]
+    prompt = f"""You are a senior short-form video executive producer reviewing candidate clips.
+Review these candidate clips and return a refined JSON object {{"clips": [...]}} where:
+1. Near-duplicate topics are removed (keep the strongest version).
+2. Each "hook" is sharpened to maximize curiosity in the first 3 seconds.
+3. "score" (0-100) reflects true viral potential on TikTok, Reels, and YouTube Shorts.
+Preserve the exact "start" and "end" timestamps of kept clips.
+
+CANDIDATES:
+{json.dumps(candidates_payload, indent=2)}
+"""
+    try:
+        raw = _call_llm(prompt)
+        parsed = _extract_json(raw)
+        reviewed = parsed.get("clips", [])
+        if not reviewed:
+            return clips
+
+        refined: list[Clip] = []
+        for rc in reviewed:
+            start = float(rc["start"])
+            end = float(rc["end"])
+            sb_raw = rc.get("score_breakdown", {})
+            raw_tags = rc.get("hashtags", [])
+            tags = [str(h).lstrip("#") for h in raw_tags if str(h).strip()] if isinstance(raw_tags, list) else []
+            refined.append(
+                Clip(
+                    start=round(start, 3),
+                    end=round(end, 3),
+                    hook=rc.get("hook", ""),
+                    title=rc.get("title", ""),
+                    score=int(rc.get("score", 70)),
+                    score_breakdown=ScoreBreakdown(
+                        hook=int(sb_raw.get("hook", 7)),
+                        flow=int(sb_raw.get("flow", 7)),
+                        value=int(sb_raw.get("value", 7)),
+                        trend=int(sb_raw.get("trend", 7)),
+                    ),
+                    reason=rc.get("reason", ""),
+                    description=rc.get("description", ""),
+                    hashtags=tags,
+                )
+            )
+        return sorted(refined, key=lambda c: c.score, reverse=True)
+    except Exception as exc:
+        logger.warning("[Stage 4] Critic pass fallback to initial selection: {}", exc)
+        return clips
 
 
 # ── Deduplication ─────────────────────────────────────────────────────────────
@@ -252,37 +577,47 @@ def select_clips(
         logger.success("[Stage 4] ✓ Loaded {} cached clips", len(clips))
         return clips
 
-    # ── Build prompt ──────────────────────────────────────────────────────────
+    # ── Pass A: Segment transcript into topic blocks ──────────────────────────
+    topic_blocks = segment_transcript(transcript)
+    logger.info("[Stage 4] Pass A segmented transcript into {} topic blocks", len(topic_blocks))
+
+    # ── Build prompt(s) & call LLM across chunks ──────────────────────────────
     prompt_template = (
         Path(__file__).parent.parent / "prompts" / "v1" / "clip_selection.txt"
     ).read_text()
 
-    formatted_transcript = _format_transcript_for_llm(transcript)
-    prompt = (
-        prompt_template
-        .replace("{CLIP_MIN}", str(CLIP_MIN_DURATION))
-        .replace("{CLIP_MAX}", str(CLIP_MAX_DURATION))
-        .replace("{TOP_N}", str(TOP_N_CLIPS))
-        .replace("{TRANSCRIPT}", formatted_transcript)
-    )
+    transcript_chunks = _chunk_transcript_for_llm(transcript)
+    raw_clips: list[dict[str, Any]] = []
 
-    if user_prompt:
-        prompt += (
-            f"\n\nIMPORTANT USER DIRECTIVE / FOCUS TOPIC:\n"
-            f"The user explicitly requested clips covering: \"{user_prompt}\".\n"
-            f"Prioritize moments from the transcript that directly relate to this theme while maintaining high virality.\n"
+    for chunk_idx, formatted_chunk in enumerate(transcript_chunks, 1):
+        prompt = (
+            prompt_template
+            .replace("{CLIP_MIN}", str(CLIP_MIN_DURATION))
+            .replace("{CLIP_MAX}", str(CLIP_MAX_DURATION))
+            .replace("{TOP_N}", str(TOP_N_CLIPS))
+            .replace("{TRANSCRIPT}", formatted_chunk)
         )
 
-    # ── LLM call ──────────────────────────────────────────────────────────────
-    logger.info("[Stage 4] Sending transcript to LLM ({} chars in prompt) …", len(prompt))
-    t0 = time.time()
-    raw_response = _call_llm(prompt)
-    elapsed = time.time() - t0
-    logger.info("[Stage 4] LLM responded in {:.1f}s", elapsed)
+        if user_prompt:
+            prompt += (
+                f"\n\nIMPORTANT USER DIRECTIVE / FOCUS TOPIC:\n"
+                f"The user explicitly requested clips covering: \"{user_prompt}\".\n"
+                f"Prioritize moments from the transcript that directly relate to this theme while maintaining high virality.\n"
+            )
 
-    # ── Parse & validate ──────────────────────────────────────────────────────
-    parsed = _extract_json(raw_response)
-    raw_clips = parsed.get("clips", [])
+        logger.info(
+            "[Stage 4] Sending transcript chunk {}/{} to LLM ({} chars in prompt) …",
+            chunk_idx, len(transcript_chunks), len(prompt),
+        )
+        t0 = time.time()
+        raw_response = _call_llm(prompt)
+        elapsed = time.time() - t0
+        logger.info("[Stage 4] LLM responded for chunk {}/{} in {:.1f}s", chunk_idx, len(transcript_chunks), elapsed)
+
+        parsed = _extract_json(raw_response)
+        chunk_clips = parsed.get("clips", [])
+        raw_clips.extend(chunk_clips)
+
     logger.info("[Stage 4] LLM returned {} raw clip candidates", len(raw_clips))
 
     all_words = transcript.all_words
@@ -317,13 +652,22 @@ def select_clips(
             sb_raw = rc.get("score_breakdown", {})
             raw_tags = rc.get("hashtags", [])
             tags = [str(h).lstrip("#") for h in raw_tags if str(h).strip()] if isinstance(raw_tags, list) else []
+            hook_str = rc.get("hook", "")
+            llm_score = float(rc.get("score", 50))
+            final_score = compute_blended_score(
+                llm_score=llm_score,
+                clip_start=start,
+                clip_end=end,
+                hook_text=hook_str,
+                transcript=transcript,
+            )
 
             clips.append(Clip(
                 start=round(start, 3),
                 end=round(end, 3),
-                hook=rc.get("hook", ""),
+                hook=hook_str,
                 title=rc.get("title", ""),
-                score=int(rc.get("score", 50)),
+                score=final_score,
                 score_breakdown=ScoreBreakdown(
                     hook=int(sb_raw.get("hook", 5)),
                     flow=int(sb_raw.get("flow", 5)),
@@ -337,8 +681,10 @@ def select_clips(
         except (KeyError, ValueError, TypeError) as e:
             logger.warning("[Stage 4] Skipping malformed clip: {} — {}", rc, e)
 
-    # ── Deduplicate & rank ────────────────────────────────────────────────────
+    # ── Deduplicate, optional critic pass, & rank ─────────────────────────────
     clips = _remove_overlapping(clips)
+    if ENABLE_CRITIC_PASS and len(clips) > 1:
+        clips = critic_pass(clips, transcript)
     clips = sorted(clips, key=lambda c: c.score, reverse=True)[:TOP_N_CLIPS]
 
     # ── Save ──────────────────────────────────────────────────────────────────

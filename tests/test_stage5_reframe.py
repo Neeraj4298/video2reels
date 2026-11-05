@@ -104,6 +104,18 @@ class TestEmaSmooth:
         assert 0.0 < res[1] < 100.0
         assert res[2] > res[1]
 
+    def test_kalman_filter_1d_smoothing(self):
+        from workers.reframe import KalmanFilter1D, _kalman_smooth
+
+        noisy = [100.0, 140.0, 90.0, 110.0, 102.0, 98.0, 100.0]
+        smoothed = _kalman_smooth(noisy, process_variance=0.01, measurement_variance=0.1)
+        assert len(smoothed) == len(noisy)
+        assert smoothed[0] == 100.0
+        # Spike at index 1 should be damped below raw 140.0
+        assert 100.0 < smoothed[1] < 140.0
+        kf = KalmanFilter1D(initial_value=50.0)
+        assert kf.reset(200.0) == 200.0
+
 
 # ── 3. Face Detection & Primary Speaker Selection ─────────────────────────────
 
