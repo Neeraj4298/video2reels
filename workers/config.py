@@ -21,10 +21,12 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
 ENABLE_CRITIC_PASS = os.getenv("ENABLE_CRITIC_PASS", "false").lower() in ("1", "true", "yes")
 
-# ── Whisper ───────────────────────────────────────────────────────────────────
+# ── Whisper (GPU primary: cuda/float16, automatic fallback to cpu/int8) ──────
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
-WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
-WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE", "int8")
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
+WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE", "float16")
+WHISPER_FALLBACK_DEVICE = "cpu"
+WHISPER_FALLBACK_COMPUTE = "int8"
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 CLIP_MIN_DURATION = int(os.getenv("CLIP_MIN_DURATION", "20"))
@@ -32,11 +34,13 @@ CLIP_MAX_DURATION = int(os.getenv("CLIP_MAX_DURATION", "90"))
 TOP_N_CLIPS = int(os.getenv("TOP_N_CLIPS", "10"))
 MAX_VIDEO_HOURS = float(os.getenv("MAX_VIDEO_HOURS", "3"))
 
-# ── Target output format ─────────────────────────────────────────────────────
+# ── Target output format (GPU NVENC primary, CPU libx264 fallback) ────────────
 OUTPUT_WIDTH = 1080
 OUTPUT_HEIGHT = 1920
-OUTPUT_CODEC = "libx264"
-OUTPUT_PRESET = "fast"
+OUTPUT_GPU_CODEC = os.getenv("OUTPUT_GPU_CODEC", "h264_nvenc")
+OUTPUT_GPU_PRESET = os.getenv("OUTPUT_GPU_PRESET", "p4")
+OUTPUT_CODEC = os.getenv("OUTPUT_CODEC", "libx264")
+OUTPUT_PRESET = os.getenv("OUTPUT_PRESET", "fast")
 OUTPUT_AUDIO_CODEC = "aac"
 OUTPUT_AUDIO_BITRATE = "128k"
 

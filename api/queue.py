@@ -49,7 +49,7 @@ def dispatch_render(
             "clip_id": str(clip_id),
             "render_settings": render_settings,
         },
-        queue=os.getenv("GPU_QUEUE", "cpu"),
+        queue=os.getenv("GPU_QUEUE", "gpu"),
     )
     return result.id
 

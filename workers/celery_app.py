@@ -15,6 +15,7 @@ import os
 import sys
 from pathlib import Path
 from celery import Celery
+from celery.signals import worker_ready
 from kombu import Exchange, Queue
 
 # Ensure project root (/app) is on sys.path so `import api.*` works in all worker processes
@@ -24,7 +25,8 @@ if _ROOT_DIR not in sys.path:
 
 # ── Build broker + backend URLs ───────────────────────────────────────────────
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-GPU_QUEUE = os.getenv("GPU_QUEUE", "cpu")
+# Primary queue for heavy stages is 'gpu'; CPU worker acts as automatic fallback consumer
+GPU_QUEUE = os.getenv("GPU_QUEUE", "gpu")
 
 celery_app = Celery(
     "video2reels",
@@ -74,3 +76,21 @@ celery_app.conf.result_expires = 86400  # 24 hours
 
 # ── Worker settings ───────────────────────────────────────────────────────────
 celery_app.conf.worker_max_tasks_per_child = 50  # recycle worker after 50 tasks (memory safety)
+
+
+@worker_ready.connect
+def _ensure_gpu_queue_fallback(sender=None, **kwargs):
+    """
+    GPU is the primary queue for transcription, reframing, and rendering.
+    When running on a dev machine without a dedicated worker-gpu container,
+    ensure the CPU worker also consumes the 'gpu' queue as fallback.
+    """
+    try:
+        if sender and hasattr(sender, "app"):
+            sender.app.control.add_consumer(
+                "gpu",
+                destination=[sender.hostname],
+            )
+    except Exception:
+        pass
+

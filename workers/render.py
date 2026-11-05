@@ -21,6 +21,7 @@ from pathlib import Path
 from loguru import logger
 from workers.config import (
     OUTPUT_WIDTH, OUTPUT_HEIGHT,
+    OUTPUT_GPU_CODEC, OUTPUT_GPU_PRESET,
     OUTPUT_CODEC, OUTPUT_PRESET,
     OUTPUT_AUDIO_CODEC, OUTPUT_AUDIO_BITRATE,
     OUTPUT_DIR,
@@ -56,6 +57,36 @@ def _slugify(text: str, max_len: int = 40) -> str:
     return slug[:max_len] or "clip"
 
 
+_NVENC_AVAILABLE: Optional[bool] = None
+
+
+def _has_nvenc_gpu() -> bool:
+    """
+    Detect whether an NVIDIA GPU device is present and FFmpeg supports h264_nvenc.
+    Primary encoding uses GPU (h264_nvenc); falls back to CPU (libx264) when False.
+    """
+    global _NVENC_AVAILABLE
+    if _NVENC_AVAILABLE is not None:
+        return _NVENC_AVAILABLE
+
+    if not Path("/dev/nvidia0").exists():
+        _NVENC_AVAILABLE = False
+        return False
+
+    try:
+        ffmpeg = _ffmpeg_bin()
+        res = subprocess.run(
+            [ffmpeg, "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        _NVENC_AVAILABLE = OUTPUT_GPU_CODEC in res.stdout
+    except Exception:
+        _NVENC_AVAILABLE = False
+    return _NVENC_AVAILABLE
+
+
 def _build_ffmpeg_cmd(
     source: Path,
     out_path: Path,
@@ -64,6 +95,7 @@ def _build_ffmpeg_cmd(
     ass_path: Path,
     meta: VideoMeta,
     watermark_path: Optional[Path] = None,
+    use_gpu: Optional[bool] = None,
 ) -> list[str]:
     """
     Build the FFmpeg command for rendering a single clip.
@@ -79,6 +111,13 @@ def _build_ffmpeg_cmd(
 
     # If watermark is provided, pass it as second input
     has_watermark = watermark_path is not None and watermark_path.exists()
+
+    # Primary: GPU NVENC (h264_nvenc); Fallback: CPU (libx264)
+    enable_gpu = _has_nvenc_gpu() if use_gpu is None else use_gpu
+    if enable_gpu:
+        vcodec_args = ["-c:v", OUTPUT_GPU_CODEC, "-preset", OUTPUT_GPU_PRESET, "-cq", "23"]
+    else:
+        vcodec_args = ["-c:v", OUTPUT_CODEC, "-preset", OUTPUT_PRESET, "-crf", "23"]
 
     if layout in ("blur_bg", "split_screen"):
         if layout == "blur_bg":
@@ -112,9 +151,7 @@ def _build_ffmpeg_cmd(
             "-map", "[out]",
             "-map", "0:a?",
             "-af", af,
-            "-c:v", OUTPUT_CODEC,
-            "-preset", OUTPUT_PRESET,
-            "-crf", "23",
+            *vcodec_args,
             "-c:a", OUTPUT_AUDIO_CODEC,
             "-b:a", OUTPUT_AUDIO_BITRATE,
             "-movflags", "+faststart",
@@ -151,9 +188,7 @@ def _build_ffmpeg_cmd(
             "-map", "[out]",
             "-map", "0:a?",
             "-af", af,
-            "-c:v", OUTPUT_CODEC,
-            "-preset", OUTPUT_PRESET,
-            "-crf", "23",
+            *vcodec_args,
             "-c:a", OUTPUT_AUDIO_CODEC,
             "-b:a", OUTPUT_AUDIO_BITRATE,
             "-movflags", "+faststart",
@@ -170,9 +205,7 @@ def _build_ffmpeg_cmd(
         "-i", str(source),
         "-vf", vf,
         "-af", af,
-        "-c:v", OUTPUT_CODEC,
-        "-preset", OUTPUT_PRESET,
-        "-crf", "23",
+        *vcodec_args,
         "-c:a", OUTPUT_AUDIO_CODEC,
         "-b:a", OUTPUT_AUDIO_BITRATE,
         "-movflags", "+faststart",
@@ -249,6 +282,25 @@ def render_clip(
 
     t0 = time.time()
     result = subprocess.run(cmd, capture_output=True, text=True)
+
+    # If primary GPU NVENC failed at runtime, fall back automatically to CPU libx264
+    if result.returncode != 0 and OUTPUT_GPU_CODEC in cmd:
+        logger.warning(
+            "[Stage 6b] GPU encoder '{}' failed; falling back to CPU encoder '{}'",
+            OUTPUT_GPU_CODEC, OUTPUT_CODEC,
+        )
+        cmd = _build_ffmpeg_cmd(
+            source=meta.path,
+            out_path=out_path,
+            clip=clip,
+            reframe=reframe,
+            ass_path=ass_path,
+            meta=meta,
+            watermark_path=watermark_path,
+            use_gpu=False,
+        )
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
     render_time = time.time() - t0
 
     if result.returncode != 0:

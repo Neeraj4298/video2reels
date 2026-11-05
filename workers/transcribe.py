@@ -17,7 +17,13 @@ from pathlib import Path
 from typing import Optional
 
 from loguru import logger
-from workers.config import WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE
+from workers.config import (
+    WHISPER_MODEL,
+    WHISPER_DEVICE,
+    WHISPER_COMPUTE,
+    WHISPER_FALLBACK_DEVICE,
+    WHISPER_FALLBACK_COMPUTE,
+)
 
 
 # ── Data models ───────────────────────────────────────────────────────────────
@@ -255,28 +261,53 @@ def transcribe(audio_path: Path, work_dir: Path) -> Transcript:
         )
 
     logger.info(
-        "[Stage 3] Loading Whisper model '{}' on {} (compute={})",
+        "[Stage 3] Loading Whisper model '{}' on primary device={} (compute={})",
         WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE,
     )
-    model = WhisperModel(
-        WHISPER_MODEL,
-        device=WHISPER_DEVICE,
-        compute_type=WHISPER_COMPUTE,
-    )
+    try:
+        model = WhisperModel(
+            WHISPER_MODEL,
+            device=WHISPER_DEVICE,
+            compute_type=WHISPER_COMPUTE,
+        )
+        raw_segments, info = model.transcribe(
+            str(audio_path),
+            word_timestamps=True,
+            vad_filter=True,
+            vad_parameters={
+                "min_silence_duration_ms": 500,
+                "speech_pad_ms": 200,
+            },
+            beam_size=5,
+        )
+        # Materialize generator so any lazy CUDA/CTranslate2 runtime errors trigger fallback here
+        raw_segments = list(raw_segments)
+    except Exception as gpu_err:
+        if WHISPER_DEVICE.lower() == "cpu":
+            raise
+        logger.warning(
+            "[Stage 3] GPU device '{}' unavailable ({}); falling back to {} (compute={})",
+            WHISPER_DEVICE, gpu_err, WHISPER_FALLBACK_DEVICE, WHISPER_FALLBACK_COMPUTE,
+        )
+        model = WhisperModel(
+            WHISPER_MODEL,
+            device=WHISPER_FALLBACK_DEVICE,
+            compute_type=WHISPER_FALLBACK_COMPUTE,
+        )
+        raw_segments, info = model.transcribe(
+            str(audio_path),
+            word_timestamps=True,
+            vad_filter=True,
+            vad_parameters={
+                "min_silence_duration_ms": 500,
+                "speech_pad_ms": 200,
+            },
+            beam_size=5,
+        )
+        raw_segments = list(raw_segments)
 
     logger.info("[Stage 3] Transcribing {} …", audio_path.name)
     t0 = time.time()
-
-    raw_segments, info = model.transcribe(
-        str(audio_path),
-        word_timestamps=True,
-        vad_filter=True,
-        vad_parameters={
-            "min_silence_duration_ms": 500,
-            "speech_pad_ms": 200,
-        },
-        beam_size=5,
-    )
 
     segments: list[Segment] = []
     for seg in raw_segments:
