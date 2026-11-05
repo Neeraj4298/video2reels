@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import Response
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import FileResponse, Response
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -324,3 +324,27 @@ async def publish_clip(
         scheduled_at=body.scheduled_at,
         message=msg,
     )
+
+
+# ── Local Storage Fallback Streaming & Upload ─────────────────────────────────
+
+@router.get("/api/clips/storage/{bucket}/{key:path}")
+async def serve_local_storage_object(bucket: str, key: str):
+    """Serve local fallback storage objects (MP4 renders, logos) when MinIO is offline."""
+    from api.storage import _local_object_path
+    p = _local_object_path(bucket, key)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="Object not found in local storage")
+    media_type = "video/mp4" if p.suffix.lower() == ".mp4" else "application/octet-stream"
+    return FileResponse(str(p), media_type=media_type, filename=p.name)
+
+
+@router.put("/api/clips/storage/{bucket}/{key:path}")
+async def upload_local_storage_object(bucket: str, key: str, request: Request):
+    """Accept direct browser PUT uploads to local storage when MinIO is offline."""
+    from api.storage import _local_object_path
+    data = await request.body()
+    p = _local_object_path(bucket, key)
+    p.write_bytes(data)
+    return {"status": "ok", "bucket": bucket, "key": key}
+

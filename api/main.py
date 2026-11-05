@@ -32,26 +32,29 @@ async def lifespan(app: FastAPI):
 
     # ── MinIO bucket bootstrap ────────────────────────────────────────────────
     try:
-        import minio as _minio
-        _s = get_settings()
-        _client = _minio.Minio(
-            _s.minio_endpoint,
-            access_key=_s.minio_access_key,
-            secret_key=_s.minio_secret_key,
-            secure=False,
-        )
-        for _bucket in [
-            _s.bucket_originals,
-            _s.bucket_audio,
-            _s.bucket_clips,
-            _s.bucket_renders,
-        ]:
-            if not _client.bucket_exists(_bucket):
-                _client.make_bucket(_bucket)
+        from api.storage import _is_minio_reachable
+        if _is_minio_reachable():
+            import minio as _minio
+            _s = get_settings()
+            _client = _minio.Minio(
+                _s.minio_endpoint,
+                access_key=_s.minio_access_key,
+                secret_key=_s.minio_secret_key,
+                secure=False,
+            )
+            for _bucket in [
+                _s.bucket_originals,
+                _s.bucket_audio,
+                _s.bucket_clips,
+                _s.bucket_renders,
+            ]:
+                if not _client.bucket_exists(_bucket):
+                    _client.make_bucket(_bucket)
     except Exception:
         # MinIO may not be running in test/dev environments — skip silently
         pass
 
+    # Add already-rendered clips from output/yt_XUWQJ2Kj2k8 if local DB is empty so user can also inspect clips immediately
     yield
 
     # ── Cleanup ───────────────────────────────────────────────────────────────

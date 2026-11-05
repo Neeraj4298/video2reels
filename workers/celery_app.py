@@ -65,6 +65,14 @@ celery_app.conf.task_routes = {
 celery_app.conf.task_acks_late = True          # re-queue on worker crash
 celery_app.conf.task_reject_on_worker_lost = True
 celery_app.conf.worker_prefetch_multiplier = 1  # one task at a time per worker slot
+celery_app.conf.broker_connection_timeout = 0.5
+celery_app.conf.broker_transport_options = {
+    "max_retries": 1,
+    "interval_start": 0,
+    "interval_step": 0.2,
+    "interval_max": 0.2,
+    "socket_connect_timeout": 0.5,
+}
 
 # ── Retries ───────────────────────────────────────────────────────────────────
 celery_app.conf.task_max_retries = 3

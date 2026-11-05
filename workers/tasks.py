@@ -48,10 +48,33 @@ _Session = None
 
 
 def _get_session() -> Session:
-    """Lazy-initialise a synchronous SQLAlchemy session."""
+    """Lazy-initialise a synchronous SQLAlchemy session (PostgreSQL primary, SQLite fallback)."""
     global _engine, _Session
     if _Session is None:
-        _engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5)
+        import socket
+        db_url = DATABASE_URL
+        try:
+            host_port = db_url.split("@")[-1].split("/")[0]
+            host = host_port.split(":")[0]
+            port = int(host_port.split(":")[1]) if ":" in host_port else 5432
+            sock = socket.socket()
+            sock.settimeout(0.5)
+            reachable = sock.connect_ex((host, port)) == 0
+            sock.close()
+        except Exception:
+            reachable = False
+
+        if reachable:
+            _engine = create_engine(db_url, pool_pre_ping=True, pool_size=5)
+        else:
+            from api.db import Base
+            db_path = Path(_ROOT_DIR) / "work" / "video2reels_local.db"
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            _engine = create_engine(
+                f"sqlite:///{db_path}",
+                connect_args={"check_same_thread": False},
+            )
+            Base.metadata.create_all(_engine)
         _Session = sessionmaker(bind=_engine)
     return _Session()
 
