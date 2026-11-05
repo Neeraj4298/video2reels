@@ -228,7 +228,16 @@ def detect_scenes(
     """
     try:
         from scenedetect import ContentDetector, detect
-        scene_list = detect(str(video_path), ContentDetector(threshold=threshold))
+        detect_kwargs: dict[str, Any] = {}
+        if start_sec > 0:
+            detect_kwargs["start_time"] = float(start_sec)
+        if end_sec is not None:
+            detect_kwargs["end_time"] = float(end_sec)
+        scene_list = detect(
+            str(video_path),
+            ContentDetector(threshold=threshold),
+            **detect_kwargs,
+        )
         cuts = []
         for s in scene_list:
             s_start = s[0].seconds
@@ -484,11 +493,14 @@ def generate_crop_filter_expression(
     crop_w: int,
     crop_h: int,
     src_w: int,
+    max_segments: int = 22,
 ) -> str:
     """
     Generate an FFmpeg crop filter string.
     - If static: 'crop=w:h:x:y'
-    - If dynamic: generates an interpolated runtime expression evaluated per frame.
+    - If dynamic: generates a simplified piecewise-linear expression bounded
+      to <= max_segments nested `if(lt(t,...))` terms so FFmpeg's expression
+      parser never hits its recursion depth limit.
     """
     if not keyframes:
         return f"crop={crop_w}:{crop_h}:{(src_w - crop_w)//2}:0"
@@ -498,15 +510,33 @@ def generate_crop_filter_expression(
     if max(x_values) - min(x_values) <= 2:
         return f"crop={crop_w}:{crop_h}:{x_values[0]}:0"
 
-    # Build piecewise linear interpolation in FFmpeg
-    # For each pair (t0, x0) -> (t1, x1):
-    # if(lt(t, t1), x0 + (x1-x0)*(t-t0)/(t1-t0), ...)
-    max_x = src_w - crop_w
-    expr = str(keyframes[-1].x)
+    # 1. Remove redundant intermediate stationary points
+    reduced: list[CropKeyframe] = [keyframes[0]]
+    for i in range(1, len(keyframes) - 1):
+        prev_kf = reduced[-1]
+        curr_kf = keyframes[i]
+        next_kf = keyframes[i + 1]
+        if abs(curr_kf.x - prev_kf.x) <= 2 and abs(next_kf.x - curr_kf.x) <= 2:
+            continue
+        reduced.append(curr_kf)
+    reduced.append(keyframes[-1])
 
-    for i in range(len(keyframes) - 2, -1, -1):
-        kf0 = keyframes[i]
-        kf1 = keyframes[i + 1]
+    # 2. Cap total segments to max_segments to stay well below FFmpeg eval recursion limit
+    if len(reduced) > max_segments:
+        indices = [
+            int(round(idx * (len(reduced) - 1) / (max_segments - 1)))
+            for idx in range(max_segments)
+        ]
+        # Deduplicate while preserving order
+        seen: set[int] = set()
+        reduced = [reduced[idx] for idx in indices if not (idx in seen or seen.add(idx))]
+
+    max_x = max(0, src_w - crop_w)
+    expr = str(reduced[-1].x)
+
+    for i in range(len(reduced) - 2, -1, -1):
+        kf0 = reduced[i]
+        kf1 = reduced[i + 1]
         dt = max(kf1.time - kf0.time, 1e-3)
         dx = kf1.x - kf0.x
 

@@ -161,8 +161,14 @@ def _build_ffmpeg_cmd(
         return cmd
 
     # Vertical smart-crop mode
-    if getattr(reframe, "crop_filter_expr", ""):
-        crop_filter = reframe.crop_filter_expr
+    raw_expr = getattr(reframe, "crop_filter_expr", "")
+    if raw_expr and raw_expr.count("if(") > 24 and getattr(reframe, "keyframes", None):
+        from workers.reframe import generate_crop_filter_expression
+        crop_filter = generate_crop_filter_expression(
+            reframe.keyframes, reframe.crop_w, reframe.crop_h, meta.width
+        )
+    elif raw_expr:
+        crop_filter = raw_expr
     elif reframe.keyframes:
         kf = reframe.keyframes[0]
         crop_filter = f"crop={kf.w}:{kf.h}:{kf.x}:{kf.y}"

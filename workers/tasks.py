@@ -760,7 +760,12 @@ def stage_reframe(self, prev: dict) -> dict:
         work_dir = Path(tmpdir)
         try:
             video_storage_key = prev.get("video_storage_key") or f"{project_id}/video.mp4"
-            video_path = download_file(cfg.bucket_originals, video_storage_key, work_dir / "video.mp4")
+            cache_vid = Path(tempfile.gettempdir()) / "video2reels_cache" / f"{project_id}_video.mp4"
+            cache_vid.parent.mkdir(parents=True, exist_ok=True)
+            if cache_vid.exists() and cache_vid.stat().st_size > 1_000_000:
+                video_path = cache_vid
+            else:
+                video_path = download_file(cfg.bucket_originals, video_storage_key, cache_vid)
             meta = prev.get("meta", {})
             src_w = int(meta.get("width") or 1920)
             src_h = int(meta.get("height") or 1080)
@@ -826,6 +831,7 @@ def stage_render_all(self, prev: dict):
             clip_data=clip_data,
             reframe_data=reframe_results[i] if i < len(reframe_results) else {},
             total_clips=len(clip_ids),
+            clip_index=i + 1,
         )
         for i, (clip_id, clip_data) in enumerate(zip(clip_ids, clips_data))
     )
@@ -846,6 +852,7 @@ def stage_render_clip(
     clip_data: dict,
     reframe_data: dict,
     total_clips: int = 1,
+    clip_index: int = 1,
 ):
     """Render a single clip: burn captions + export 1080x1920 MP4."""
     from api.config import get_settings
@@ -924,9 +931,14 @@ def stage_render_clip(
         work_dir = Path(tmpdir)
         try:
             clip = Clip.from_dict(clip_data)
-            video_path = download_file(
-                cfg.bucket_originals, video_storage_key, work_dir / "video.mp4"
-            )
+            cache_vid = Path(tempfile.gettempdir()) / "video2reels_cache" / f"{project_id}_video.mp4"
+            cache_vid.parent.mkdir(parents=True, exist_ok=True)
+            if cache_vid.exists() and cache_vid.stat().st_size > 1_000_000:
+                video_path = cache_vid
+            else:
+                video_path = download_file(
+                    cfg.bucket_originals, video_storage_key, cache_vid
+                )
 
             watermark_path = None
             if brand_logo_key and object_exists(cfg.bucket_originals, brand_logo_key):
@@ -980,7 +992,7 @@ def stage_render_clip(
                 meta=meta,
                 work_dir=work_dir,
                 project_id=project_id,
-                clip_index=1,
+                clip_index=clip_index,
                 style=style,
                 watermark_path=watermark_path,
             )
@@ -1029,6 +1041,7 @@ def _check_and_mark_pipeline_complete(project_id: str, total_clips: int):
             total = len(clips) or total_clips or 1
 
             progress = 77 + int((done_count / total) * 23)
+            _update_job_status(project_id, "render", JobStatus.running, min(progress, 99))
             _emit(
                 project_id,
                 "rendering",

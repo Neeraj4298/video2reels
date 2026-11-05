@@ -58,9 +58,11 @@ def _run_pipeline_in_thread(
                 clip_data=cdata,
                 reframe_data=reframes[i] if i < len(reframes) else {},
                 total_clips=len(clip_ids),
+                clip_index=i + 1,
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).exception("Background pipeline error for %s: %s", project_id, exc)
 
 
 def dispatch_pipeline(
