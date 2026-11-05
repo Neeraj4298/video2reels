@@ -18,12 +18,12 @@ from workers.config import FFMPEG_PATH
 from workers.ingest import VideoMeta, _ffmpeg_bin
 
 
-def extract_audio(meta: VideoMeta, work_dir: Path) -> Path:
+def extract_audio(meta: VideoMeta | Path | str, work_dir: Path) -> Path:
     """
     Extract mono 16 kHz WAV from the source video.
 
     Args:
-        meta:     VideoMeta from Stage 1
+        meta:     VideoMeta from Stage 1 or Path to video file
         work_dir: scratch directory for this project
 
     Returns:
@@ -37,11 +37,14 @@ def extract_audio(meta: VideoMeta, work_dir: Path) -> Path:
         logger.info("[Stage 2] Cached audio found, skipping extraction.")
         return out_path
 
+    input_path = meta.path if hasattr(meta, "path") else Path(meta)
+    duration_sec = getattr(meta, "duration", 0.0) or 0.0
+
     ffmpeg = _ffmpeg_bin()
     cmd = [
         ffmpeg,
         "-y",                        # overwrite if exists
-        "-i", str(meta.path),
+        "-i", str(input_path),
         "-vn",                       # no video
         "-ac", "1",                  # mono
         "-ar", "16000",              # 16 kHz sample rate
@@ -55,7 +58,7 @@ def extract_audio(meta: VideoMeta, work_dir: Path) -> Path:
         raise RuntimeError(f"FFmpeg audio extraction failed:\n{result.stderr[-2000:]}")
 
     size_mb = out_path.stat().st_size / 1_048_576
-    duration_min = meta.duration / 60
+    duration_min = duration_sec / 60
     logger.success(
         "[Stage 2] ✓ Audio extracted: {:.1f} MB  |  {:.1f} min", size_mb, duration_min
     )

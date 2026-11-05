@@ -134,12 +134,22 @@ def dispatch_resume(project_id: uuid.UUID) -> str:
     Resume an interrupted or failed pipeline from the last completed stage.
     Returns the Celery task ID.
     """
-    result = celery_app.send_task(
-        "workers.tasks.resume_pipeline",
-        kwargs={"project_id": str(project_id)},
-        queue="cpu",
-    )
-    return result.id
+    try:
+        result = celery_app.send_task(
+            "workers.tasks.resume_pipeline",
+            kwargs={"project_id": str(project_id)},
+            queue="cpu",
+            retry=False,
+        )
+        return result.id
+    except Exception:
+        task_id = f"local-resume-{uuid.uuid4()}"
+        threading.Thread(
+            target=_run_pipeline_in_thread,
+            args=(str(project_id), f"{project_id}/video.mp4", None),
+            daemon=True,
+        ).start()
+        return task_id
 
 
 def dispatch_reclip(project_id: uuid.UUID, user_prompt: str | None = None) -> str:
@@ -147,10 +157,20 @@ def dispatch_reclip(project_id: uuid.UUID, user_prompt: str | None = None) -> st
     Re-clip an existing project using its transcript, with optional custom user prompt.
     Returns the Celery task ID.
     """
-    result = celery_app.send_task(
-        "workers.tasks.reclip_pipeline",
-        kwargs={"project_id": str(project_id), "user_prompt": user_prompt},
-        queue="cpu",
-    )
-    return result.id
+    try:
+        result = celery_app.send_task(
+            "workers.tasks.reclip_pipeline",
+            kwargs={"project_id": str(project_id), "user_prompt": user_prompt},
+            queue="cpu",
+            retry=False,
+        )
+        return result.id
+    except Exception:
+        task_id = f"local-reclip-{uuid.uuid4()}"
+        threading.Thread(
+            target=_run_pipeline_in_thread,
+            args=(str(project_id), f"{project_id}/video.mp4", user_prompt),
+            daemon=True,
+        ).start()
+        return task_id
 

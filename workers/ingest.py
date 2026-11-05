@@ -80,6 +80,7 @@ def download_url(url: str, out_dir: Path) -> Path:
         "--ffmpeg-location", ffmpeg_dir,
         "--restrict-filenames",
         "--hls-prefer-native",
+        "--concurrent-fragments", "8",
         "--format", (
             "bestvideo[ext=mp4][vcodec^=avc1][protocol^=http][height<=1080]+bestaudio[ext=m4a][protocol^=http]/"
             "bestvideo[ext=mp4][protocol^=http][height<=1080]+bestaudio[ext=m4a][protocol^=http]/"

@@ -40,7 +40,7 @@ logger = get_task_logger(__name__)
 # ── Synchronous DB helper ─────────────────────────────────────────────────────
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql+psycopg2://video2reels:video2reels@postgres:5432/video2reels",
+    "postgresql+psycopg2://video2reels:video2reels@localhost:5432/video2reels",
 ).replace("+asyncpg", "+psycopg2")
 
 _engine = None
@@ -53,16 +53,22 @@ def _get_session() -> Session:
     if _Session is None:
         import socket
         db_url = DATABASE_URL
-        try:
-            host_port = db_url.split("@")[-1].split("/")[0]
-            host = host_port.split(":")[0]
-            port = int(host_port.split(":")[1]) if ":" in host_port else 5432
-            sock = socket.socket()
-            sock.settimeout(0.5)
-            reachable = sock.connect_ex((host, port)) == 0
-            sock.close()
-        except Exception:
-            reachable = False
+        reachable = False
+        for candidate_url in (db_url, db_url.replace("@postgres:", "@localhost:")):
+            try:
+                host_port = candidate_url.split("@")[-1].split("/")[0]
+                host = host_port.split(":")[0]
+                port = int(host_port.split(":")[1]) if ":" in host_port else 5432
+                sock = socket.socket()
+                sock.settimeout(0.5)
+                if sock.connect_ex((host, port)) == 0:
+                    reachable = True
+                    db_url = candidate_url
+                    sock.close()
+                    break
+                sock.close()
+            except Exception:
+                pass
 
         if reachable:
             _engine = create_engine(db_url, pool_pre_ping=True, pool_size=5)
@@ -574,7 +580,18 @@ def stage_transcribe(self, prev: dict) -> dict:
         work_dir = Path(tmpdir)
         try:
             audio_path = download_file(cfg.bucket_audio, prev["audio_key"], work_dir / "audio.wav")
-            transcript = transcribe(audio_path, work_dir)
+
+            def _on_transcribe_progress(done_sec: float, total_sec: float):
+                ratio = min(1.0, max(0.0, done_sec / max(1.0, total_sec)))
+                pct = 37 + int(ratio * 17)
+                msg = f"Transcribing audio ({int(done_sec)}s / {int(total_sec)}s)…"
+                _emit(project_id, "transcribing", pct, msg)
+                _update_job_status(project_id, "transcribe", JobStatus.running, pct)
+
+            try:
+                transcript = transcribe(audio_path, work_dir, progress_callback=_on_transcribe_progress)
+            except TypeError:
+                transcript = transcribe(audio_path, work_dir)
         except Exception as exc:
             logger.error("[transcribe] failed: %s", exc)
             _emit(project_id, "transcribing", 0, f"Transcription failed: {exc}")

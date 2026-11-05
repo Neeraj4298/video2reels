@@ -88,7 +88,13 @@ export default function ProjectPage() {
   const isProcessing = project?.status === "processing" || project?.status === "pending";
   const isDone = project?.status === "done";
   const isFailed = project?.status === "failed";
-  const currentProgress = liveEvent?.progress ?? 0;
+  const activeJob = project?.jobs?.[0];
+  const currentProgress = liveEvent?.progress ?? activeJob?.progress ?? 0;
+  const currentStageLabel = liveEvent?.stage
+    ? `${liveEvent.stage} — ${liveEvent.message}`
+    : activeJob?.stage
+      ? `${activeJob.stage} — Running (${activeJob.progress}%)…`
+      : "Waiting for worker…";
 
   return (
     <div className="app-shell">
@@ -161,9 +167,7 @@ export default function ProjectPage() {
                   <div className="mt-6">
                     <div className="flex items-center justify-between mb-2">
                       <span style={{ fontSize: "0.875rem", color: "var(--text-secondary)" }}>
-                        {liveEvent?.stage
-                          ? `${liveEvent.stage} — ${liveEvent.message}`
-                          : "Waiting for worker…"}
+                        {currentStageLabel}
                       </span>
                       <span className="font-mono" style={{ fontSize: "0.875rem", color: "var(--accent-400)" }}>
                         {currentProgress}%

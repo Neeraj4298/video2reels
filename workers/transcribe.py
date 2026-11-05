@@ -14,7 +14,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from loguru import logger
 from workers.config import (
@@ -225,7 +225,11 @@ def diarize_transcript(
 
 # ── Core function ─────────────────────────────────────────────────────────────
 
-def transcribe(audio_path: Path, work_dir: Path) -> Transcript:
+def transcribe(
+    audio_path: Path,
+    work_dir: Path,
+    progress_callback: Optional[ Any ] = None,
+) -> Transcript:
     """
     Transcribe audio using faster-whisper with word-level timestamps.
 
@@ -264,13 +268,14 @@ def transcribe(audio_path: Path, work_dir: Path) -> Transcript:
         "[Stage 3] Loading Whisper model '{}' on primary device={} (compute={})",
         WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE,
     )
+    t0 = time.time()
     try:
         model = WhisperModel(
             WHISPER_MODEL,
             device=WHISPER_DEVICE,
             compute_type=WHISPER_COMPUTE,
         )
-        raw_segments, info = model.transcribe(
+        raw_segments_gen, info = model.transcribe(
             str(audio_path),
             word_timestamps=True,
             vad_filter=True,
@@ -280,8 +285,9 @@ def transcribe(audio_path: Path, work_dir: Path) -> Transcript:
             },
             beam_size=5,
         )
-        # Materialize generator so any lazy CUDA/CTranslate2 runtime errors trigger fallback here
-        raw_segments = list(raw_segments)
+        # Peek first segment to verify CUDA execution works before streaming
+        raw_iter = iter(raw_segments_gen)
+        first_seg = next(raw_iter, None)
     except Exception as gpu_err:
         if WHISPER_DEVICE.lower() == "cpu":
             raise
@@ -294,7 +300,7 @@ def transcribe(audio_path: Path, work_dir: Path) -> Transcript:
             device=WHISPER_FALLBACK_DEVICE,
             compute_type=WHISPER_FALLBACK_COMPUTE,
         )
-        raw_segments, info = model.transcribe(
+        raw_segments_gen, info = model.transcribe(
             str(audio_path),
             word_timestamps=True,
             vad_filter=True,
@@ -304,13 +310,22 @@ def transcribe(audio_path: Path, work_dir: Path) -> Transcript:
             },
             beam_size=5,
         )
-        raw_segments = list(raw_segments)
+        raw_iter = iter(raw_segments_gen)
+        first_seg = next(raw_iter, None)
 
     logger.info("[Stage 3] Transcribing {} …", audio_path.name)
-    t0 = time.time()
+
+    def _iter_all():
+        if first_seg is not None:
+            yield first_seg
+        for s in raw_iter:
+            yield s
 
     segments: list[Segment] = []
-    for seg in raw_segments:
+    last_emit = 0.0
+    total_dur = max(1.0, float(getattr(info, "duration", 0.0) or 1.0))
+
+    for seg in _iter_all():
         words = []
         for w in (seg.words or []):
             words.append(Word(
@@ -325,6 +340,13 @@ def transcribe(audio_path: Path, work_dir: Path) -> Transcript:
             text=seg.text,
             words=words,
         ))
+        now_t = time.time()
+        if progress_callback and (now_t - last_emit >= 2.5):
+            last_emit = now_t
+            try:
+                progress_callback(seg.end, total_dur)
+            except Exception:
+                pass
 
     elapsed = time.time() - t0
     diarize_segments(segments, audio_path=audio_path)
