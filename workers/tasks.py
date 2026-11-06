@@ -126,6 +126,8 @@ def _update_job_status(
                 job.attempts = attempts
             if error is not None:
                 job.error = error
+            elif status_val.value in ("running", "done"):
+                job.error = None
             now = datetime.now(timezone.utc)
             if status_val.value == "running" and not job.started_at:
                 job.started_at = now
@@ -215,7 +217,8 @@ def resume_pipeline(self, project_id: str):
         # Check 1: Ingest complete?
         if not video or not video.duration or video.duration <= 0:
             logger.info("[resume] Resuming from Stage 1: Ingest")
-            return run_pipeline.delay(project_id, storage_key)
+            resume_key = "" if getattr(proj, "source_url", None) else storage_key
+            return run_pipeline.delay(project_id, resume_key)
 
         video_meta = {
             "duration": video.duration,
@@ -389,7 +392,7 @@ def stage_ingest(
 ) -> dict:
     """Download/validate the video and update the project record."""
     from api.models import Project, Video, Job, ProjectStatus, JobStatus
-    from api.storage import download_file, upload_file
+    from api.storage import download_file, upload_file, object_exists
     from api.config import get_settings
     from workers.ingest import ingest_video
 
@@ -424,7 +427,10 @@ def stage_ingest(
         try:
             # Determine source: MinIO key vs URL vs project source_url
             source_input = video_storage_key
-            if not source_input:
+            if not source_input or (
+                not source_input.startswith(("http://", "https://"))
+                and not object_exists(cfg.bucket_originals, source_input)
+            ):
                 with _get_session() as db:
                     proj = db.get(Project, uuid.UUID(project_id))
                     if proj and proj.source_url:

@@ -185,7 +185,8 @@ def segment_transcript(
 
 def _format_segment_line(index: int, seg: Segment) -> str:
     speaker_prefix = f"({seg.speaker}) " if seg.speaker else ""
-    return f"[{index:04d}] {seg.start:.2f}s–{seg.end:.2f}s: {speaker_prefix}{seg.text.strip()}"
+    clean_text = re.sub(r"(\S+)(?:\s+\1){4,}", r"\1", seg.text.strip())[:300]
+    return f"[{index:04d}] {seg.start:.2f}s–{seg.end:.2f}s: {speaker_prefix}{clean_text}"
 
 
 def _format_transcript_for_llm(transcript: Transcript, max_chars: int = 80_000) -> str:
@@ -294,18 +295,21 @@ def _snap_to_word_boundary(
 # ── LLM callers ──────────────────────────────────────────────────────────────
 
 def _call_gemini(prompt: str) -> str:
+    if not GEMINI_API_KEY or GEMINI_API_KEY.startswith("your_"):
+        raise RuntimeError("GEMINI_API_KEY is not configured (placeholder key in .env)")
     from google import genai
     from google.genai import types
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     for model_name in ("gemini-2.5-flash", "gemini-2.0-flash"):
         try:
+            cfg_kwargs: dict[str, Any] = {"response_mime_type": "application/json"}
+            if "2.5" in model_name and hasattr(types, "ThinkingConfig"):
+                cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
             response = client.models.generate_content(
                 model=model_name,
                 contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                ),
+                config=types.GenerateContentConfig(**cfg_kwargs),
             )
             return response.text
         except Exception as exc:
@@ -315,6 +319,8 @@ def _call_gemini(prompt: str) -> str:
 
 
 def _call_anthropic(prompt: str) -> str:
+    if not ANTHROPIC_API_KEY or ANTHROPIC_API_KEY.startswith("your_"):
+        raise RuntimeError("ANTHROPIC_API_KEY is not configured (placeholder key in .env)")
     import anthropic
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     message = client.messages.create(
@@ -622,6 +628,36 @@ def _heuristic_select_clips(
 
         i = max(i + 1, end_idx + 1)
 
+    # If segment boundaries were too wide/sparse to land in [CLIP_MIN_DURATION, CLIP_MAX_DURATION],
+    # create uniform 35s windows snapped to word timestamps
+    if not candidates and transcript.duration >= CLIP_MIN_DURATION and transcript.all_words:
+        all_w = transcript.all_words
+        win_dur = min(40.0, float(CLIP_MAX_DURATION))
+        t_cur = max(0.0, all_w[0].start)
+        while t_cur + CLIP_MIN_DURATION <= transcript.duration and len(candidates) < TOP_N_CLIPS:
+            t_end = min(transcript.duration, t_cur + win_dur)
+            win_words = [w for w in all_w if t_cur <= w.start <= t_end]
+            if win_words:
+                s_real = win_words[0].start
+                e_real = win_words[-1].end
+                if e_real - s_real < CLIP_MIN_DURATION:
+                    e_real = min(transcript.duration, s_real + max(CLIP_MIN_DURATION + 2.0, 25.0))
+                text_snip = " ".join(w.text.strip() for w in win_words[:20]).strip()
+                text_snip = re.sub(r"(\S+)(?:\s+\1){3,}", r"\1", text_snip)[:80]
+                idx_num = len(candidates) + 1
+                candidates.append({
+                    "start": round(s_real, 2),
+                    "end": round(e_real, 2),
+                    "hook": text_snip or f"Key Moment #{idx_num}",
+                    "title": f"Highlight Clip #{idx_num}",
+                    "score": max(70, 88 - idx_num * 3),
+                    "score_breakdown": {"hook": 8, "flow": 8, "value": 8, "trend": 8},
+                    "reason": "Engaging spoken segment",
+                    "description": f"{text_snip or 'Inspirational message'} 🔥",
+                    "hashtags": ["shorts", "reels", "fyp", "viral", "inspiration"],
+                })
+            t_cur += win_dur + 5.0
+
     candidates.sort(key=lambda c: c["score"], reverse=True)
     return candidates[:TOP_N_CLIPS]
 
@@ -727,78 +763,86 @@ def select_clips(
             parsed = _extract_json(raw_response)
             chunk_clips = parsed.get("clips", [])
             raw_clips.extend(chunk_clips)
-        except ValueError:
-            raise
         except Exception as llm_exc:
             logger.warning(
-                "[Stage 4] LLM call failed ({}); using heuristic topic & hook selector fallback",
+                "[Stage 4] LLM call/parse failed ({}); using heuristic topic & hook selector fallback",
                 llm_exc,
             )
             raw_clips = _heuristic_select_clips(transcript, user_prompt=user_prompt)
             break
 
     logger.info("[Stage 4] LLM returned {} raw clip candidates", len(raw_clips))
+    if not raw_clips and transcript.duration >= CLIP_MIN_DURATION:
+        logger.info("[Stage 4] Using heuristic clip selector fallback for {:.1f}s video", transcript.duration)
+        raw_clips = _heuristic_select_clips(transcript, user_prompt=user_prompt)
 
     all_words = transcript.all_words
     valid_start_times = {round(w.start, 1) for w in all_words}
 
-    clips: list[Clip] = []
-    for rc in raw_clips:
-        try:
-            start = float(rc["start"])
-            end = float(rc["end"])
+    def _build_clips_from_raw(candidates_list: list[dict[str, Any]]) -> list[Clip]:
+        built: list[Clip] = []
+        for rc in candidates_list:
+            try:
+                start = float(rc["start"])
+                end = float(rc["end"])
 
-            # Validate timestamps exist in transcript (within 2s tolerance)
-            if not any(abs(t - start) < 2.0 for t in valid_start_times):
-                logger.warning(
-                    "[Stage 4] Skipping clip {:.1f}s — start time not in transcript",
-                    start,
+                # Validate timestamps exist in transcript (within 2s tolerance)
+                if valid_start_times and not any(abs(t - start) < 2.0 for t in valid_start_times):
+                    logger.warning(
+                        "[Stage 4] Skipping clip {:.1f}s — start time not in transcript",
+                        start,
+                    )
+                    continue
+
+                # Validate duration constraints
+                duration = end - start
+                if duration < CLIP_MIN_DURATION or duration > CLIP_MAX_DURATION:
+                    logger.warning(
+                        "[Stage 4] Skipping clip {:.1f}s–{:.1f}s — duration {:.1f}s out of range",
+                        start, end, duration,
+                    )
+                    continue
+
+                # Snap to word boundaries
+                start, end = _snap_to_word_boundary(start, end, all_words)
+
+                sb_raw = rc.get("score_breakdown", {})
+                raw_tags = rc.get("hashtags", [])
+                tags = [str(h).lstrip("#") for h in raw_tags if str(h).strip()] if isinstance(raw_tags, list) else []
+                hook_str = rc.get("hook", "")
+                llm_score = float(rc.get("score", 50))
+                final_score = compute_blended_score(
+                    llm_score=llm_score,
+                    clip_start=start,
+                    clip_end=end,
+                    hook_text=hook_str,
+                    transcript=transcript,
                 )
-                continue
 
-            # Validate duration constraints
-            duration = end - start
-            if duration < CLIP_MIN_DURATION or duration > CLIP_MAX_DURATION:
-                logger.warning(
-                    "[Stage 4] Skipping clip {:.1f}s–{:.1f}s — duration {:.1f}s out of range",
-                    start, end, duration,
-                )
-                continue
+                built.append(Clip(
+                    start=round(start, 3),
+                    end=round(end, 3),
+                    hook=hook_str,
+                    title=rc.get("title", ""),
+                    score=final_score,
+                    score_breakdown=ScoreBreakdown(
+                        hook=int(sb_raw.get("hook", 5)),
+                        flow=int(sb_raw.get("flow", 5)),
+                        value=int(sb_raw.get("value", 5)),
+                        trend=int(sb_raw.get("trend", 5)),
+                    ),
+                    reason=rc.get("reason", ""),
+                    description=rc.get("description", ""),
+                    hashtags=tags,
+                ))
+            except (KeyError, ValueError, TypeError) as e:
+                logger.warning("[Stage 4] Skipping malformed clip: {} — {}", rc, e)
+        return built
 
-            # Snap to word boundaries
-            start, end = _snap_to_word_boundary(start, end, all_words)
-
-            sb_raw = rc.get("score_breakdown", {})
-            raw_tags = rc.get("hashtags", [])
-            tags = [str(h).lstrip("#") for h in raw_tags if str(h).strip()] if isinstance(raw_tags, list) else []
-            hook_str = rc.get("hook", "")
-            llm_score = float(rc.get("score", 50))
-            final_score = compute_blended_score(
-                llm_score=llm_score,
-                clip_start=start,
-                clip_end=end,
-                hook_text=hook_str,
-                transcript=transcript,
-            )
-
-            clips.append(Clip(
-                start=round(start, 3),
-                end=round(end, 3),
-                hook=hook_str,
-                title=rc.get("title", ""),
-                score=final_score,
-                score_breakdown=ScoreBreakdown(
-                    hook=int(sb_raw.get("hook", 5)),
-                    flow=int(sb_raw.get("flow", 5)),
-                    value=int(sb_raw.get("value", 5)),
-                    trend=int(sb_raw.get("trend", 5)),
-                ),
-                reason=rc.get("reason", ""),
-                description=rc.get("description", ""),
-                hashtags=tags,
-            ))
-        except (KeyError, ValueError, TypeError) as e:
-            logger.warning("[Stage 4] Skipping malformed clip: {} — {}", rc, e)
+    clips = _build_clips_from_raw(raw_clips)
+    if not clips and transcript.duration >= CLIP_MIN_DURATION:
+        fallback_raw = _heuristic_select_clips(transcript, user_prompt=user_prompt)
+        clips = _build_clips_from_raw(fallback_raw)
 
     # ── Deduplicate, optional critic pass, & rank ─────────────────────────────
     clips = _remove_overlapping(clips)

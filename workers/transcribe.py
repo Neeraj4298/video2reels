@@ -284,6 +284,8 @@ def transcribe(
                 "speech_pad_ms": 200,
             },
             beam_size=5,
+            condition_on_previous_text=False,
+            repetition_penalty=1.15,
         )
         # Peek first segment to verify CUDA execution works before streaming
         raw_iter = iter(raw_segments_gen)
@@ -309,6 +311,8 @@ def transcribe(
                 "speech_pad_ms": 200,
             },
             beam_size=5,
+            condition_on_previous_text=False,
+            repetition_penalty=1.15,
         )
         raw_iter = iter(raw_segments_gen)
         first_seg = next(raw_iter, None)

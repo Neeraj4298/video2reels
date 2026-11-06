@@ -148,7 +148,7 @@ def dispatch_resume(project_id: uuid.UUID) -> str:
         task_id = f"local-resume-{uuid.uuid4()}"
         threading.Thread(
             target=_run_pipeline_in_thread,
-            args=(str(project_id), f"{project_id}/video.mp4", None),
+            args=(str(project_id), "", None),
             daemon=True,
         ).start()
         return task_id
