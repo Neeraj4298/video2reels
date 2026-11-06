@@ -280,8 +280,9 @@ def transcribe(
             word_timestamps=True,
             vad_filter=True,
             vad_parameters={
+                "threshold": 0.3,
                 "min_silence_duration_ms": 500,
-                "speech_pad_ms": 200,
+                "speech_pad_ms": 250,
             },
             beam_size=5,
             condition_on_previous_text=False,
@@ -307,8 +308,9 @@ def transcribe(
             word_timestamps=True,
             vad_filter=True,
             vad_parameters={
+                "threshold": 0.3,
                 "min_silence_duration_ms": 500,
-                "speech_pad_ms": 200,
+                "speech_pad_ms": 250,
             },
             beam_size=5,
             condition_on_previous_text=False,
@@ -351,6 +353,37 @@ def transcribe(
                 progress_callback(seg.end, total_dur)
             except Exception:
                 pass
+
+    # If Silero VAD filtered out >65% of speech (common on videos with loud background music),
+    # retry once with vad_filter=False so spoken content over music is preserved.
+    covered_dur = sum(max(0.0, s.end - s.start) for s in segments)
+    if total_dur >= 30.0 and covered_dur < 0.35 * total_dur:
+        logger.warning(
+            "[Stage 3] VAD covered only {:.1f}s/{:.1f}s (background music likely); re-running with vad_filter=False",
+            covered_dur, total_dur,
+        )
+        no_vad_gen, info = model.transcribe(
+            str(audio_path),
+            word_timestamps=True,
+            vad_filter=False,
+            beam_size=5,
+            condition_on_previous_text=False,
+            repetition_penalty=1.15,
+        )
+        segments = []
+        for seg in no_vad_gen:
+            words = [
+                Word(text=w.word, start=w.start, end=w.end, probability=w.probability)
+                for w in (seg.words or [])
+            ]
+            segments.append(Segment(start=seg.start, end=seg.end, text=seg.text, words=words))
+            now_t = time.time()
+            if progress_callback and (now_t - last_emit >= 2.5):
+                last_emit = now_t
+                try:
+                    progress_callback(seg.end, total_dur)
+                except Exception:
+                    pass
 
     elapsed = time.time() - t0
     diarize_segments(segments, audio_path=audio_path)
