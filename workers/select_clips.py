@@ -297,8 +297,18 @@ def _snap_to_word_boundary(
 def _call_gemini(prompt: str) -> str:
     if not GEMINI_API_KEY or GEMINI_API_KEY.startswith("your_"):
         raise RuntimeError("GEMINI_API_KEY is not configured (placeholder key in .env)")
-    from google import genai
-    from google.genai import types
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        import subprocess
+        import sys
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--no-cache-dir", "--quiet", "google-genai>=1.0"],
+            check=False,
+        )
+        from google import genai
+        from google.genai import types
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     for model_name in ("gemini-2.5-flash", "gemini-2.0-flash"):

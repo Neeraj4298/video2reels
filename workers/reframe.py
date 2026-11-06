@@ -21,12 +21,30 @@ import json
 import math
 import os
 import subprocess
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-import cv2
-import numpy as np
+try:
+    import cv2
+    import numpy as np
+except ImportError:
+    subprocess.run(
+        [
+            sys.executable, "-m", "pip", "install",
+            "--no-cache-dir", "--quiet", "--force-reinstall",
+            "opencv-python-headless>=4.10", "numpy>=1.26",
+        ],
+        check=False,
+    )
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        cv2 = None  # type: ignore[assignment]
+        np = None   # type: ignore[assignment]
+
 from loguru import logger
 
 from workers.config import (
@@ -648,6 +666,21 @@ def compute_reframe(
 
     raw_positions = []
     faces_detected_count = 0
+    if cv2 is None:
+        logger.warning("[Stage 5] OpenCV unavailable; using center-crop fallback")
+        kf = CropKeyframe(frame=0, time=0.0, x=center_x, y=0, w=crop_w, h=crop_h)
+        expr = f"crop={crop_w}:{crop_h}:{center_x}:0"
+        return ReframeResult(
+            clip=clip,
+            video_path=source_video,
+            keyframes=[kf],
+            crop_w=crop_w,
+            crop_h=crop_h,
+            layout="vertical",
+            face_in_frame_ratio=1.0,
+            crop_filter_expr=expr,
+        )
+
     cap = cv2.VideoCapture(str(source_video))
     prev_face_cx = None
 

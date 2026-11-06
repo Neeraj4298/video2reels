@@ -23,10 +23,31 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-# Ensure project root (/app) is on sys.path so `import api.*` works in all worker processes
-_ROOT_DIR = str(Path(__file__).resolve().parent.parent)
-if _ROOT_DIR not in sys.path:
-    sys.path.insert(0, _ROOT_DIR)
+# Ensure project root (/app) and local .venv site-packages are on sys.path in all worker processes
+_ROOT_PATH = Path(__file__).resolve().parent.parent
+_ROOT_DIR = str(_ROOT_PATH)
+
+
+def _ensure_venv_paths(*reload_modules: str) -> None:
+    if _ROOT_DIR not in sys.path:
+        sys.path.insert(0, _ROOT_DIR)
+    for _sp in sorted((_ROOT_PATH / ".venv" / "lib").glob("python*/site-packages")):
+        if _sp.is_dir() and str(_sp) not in sys.path:
+            sys.path.insert(1, str(_sp))
+    for _b in (str(_ROOT_PATH / ".venv" / "bin"), str(_ROOT_PATH / "bin")):
+        if Path(_b).is_dir() and _b not in os.environ.get("PATH", "").split(os.pathsep):
+            os.environ["PATH"] = f"{_b}{os.pathsep}{os.environ.get('PATH', '')}"
+    if "pytest" not in sys.modules and reload_modules:
+        import importlib
+        for mod_name in reload_modules:
+            if mod_name in sys.modules:
+                try:
+                    importlib.reload(sys.modules[mod_name])
+                except Exception:
+                    pass
+
+
+_ensure_venv_paths()
 
 from celery import chain, group
 from celery.utils.log import get_task_logger
@@ -391,6 +412,7 @@ def stage_ingest(
     user_prompt: str | None = None,
 ) -> dict:
     """Download/validate the video and update the project record."""
+    _ensure_venv_paths("workers.config", "workers.ingest")
     from api.models import Project, Video, Job, ProjectStatus, JobStatus
     from api.storage import download_file, upload_file, object_exists
     from api.config import get_settings
@@ -507,6 +529,7 @@ def stage_ingest(
 )
 def stage_audio(self, prev: dict) -> dict:
     """Extract mono 16kHz WAV from the original video."""
+    _ensure_venv_paths("workers.config", "workers.audio_extract")
     from api.config import get_settings
     from api.models import JobStatus
     from api.storage import download_file, upload_file, object_exists
@@ -555,6 +578,7 @@ def stage_audio(self, prev: dict) -> dict:
 )
 def stage_transcribe(self, prev: dict) -> dict:
     """Run faster-whisper ASR to produce word-level transcript."""
+    _ensure_venv_paths("workers.config", "workers.transcribe")
     from api.config import get_settings
     from api.models import JobStatus, Transcript, Video
     from api.storage import download_file
@@ -633,6 +657,7 @@ def stage_transcribe(self, prev: dict) -> dict:
 )
 def stage_select_clips(self, prev: dict) -> dict:
     """Use LLM to select and score the best clips."""
+    _ensure_venv_paths("workers.config", "workers.select_clips")
     from api.models import Clip as ClipModel, ClipStatus, JobStatus, Layout, RenderSettings
     from workers.select_clips import select_clips
     from workers.transcribe import Transcript
@@ -731,6 +756,7 @@ def stage_select_clips(self, prev: dict) -> dict:
 )
 def stage_reframe(self, prev: dict) -> dict:
     """Compute 9:16 crop keyframes for each clip."""
+    _ensure_venv_paths("workers.config", "workers.reframe")
     from api.config import get_settings
     from api.models import JobStatus, RenderSettings
     from api.storage import download_file
@@ -861,6 +887,7 @@ def stage_render_clip(
     clip_index: int = 1,
 ):
     """Render a single clip: burn captions + export 1080x1920 MP4."""
+    _ensure_venv_paths("workers.config", "workers.captions", "workers.render")
     from api.config import get_settings
     from api.models import (
         Clip as ClipModel,

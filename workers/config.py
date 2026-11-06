@@ -3,15 +3,37 @@ Shared configuration loaded from .env
 All workers import from here — single source of truth.
 """
 import os
+import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-ROOT_DIR = Path(__file__).parent.parent
+# ── Paths & Automatic .venv Bootstrap ─────────────────────────────────────────
+ROOT_DIR = Path(__file__).resolve().parent.parent
+
+# Ensure project root, .venv/bin, ./bin, and .venv site-packages are always active
+# even if the user starts uvicorn/celery from another conda/venv environment.
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+for _sp in sorted((ROOT_DIR / ".venv" / "lib").glob("python*/site-packages")):
+    if _sp.is_dir() and str(_sp) not in sys.path:
+        sys.path.insert(1, str(_sp))
+
+_extra_bins = [
+    str(ROOT_DIR / ".venv" / "bin"),
+    str(ROOT_DIR / "bin"),
+    str(Path.home() / ".local" / "bin"),
+]
+_curr_path = os.environ.get("PATH", "")
+for _b in reversed(_extra_bins):
+    if Path(_b).is_dir() and _b not in _curr_path.split(os.pathsep):
+        _curr_path = f"{_b}{os.pathsep}{_curr_path}" if _curr_path else _b
+os.environ["PATH"] = _curr_path
+
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", ROOT_DIR / "output"))
-FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")   # override with ./bin/ffmpeg if static
+FFMPEG_PATH = os.getenv("FFMPEG_PATH", str(ROOT_DIR / "bin" / "ffmpeg"))
 
 # ── LLM ───────────────────────────────────────────────────────────────────────
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini")

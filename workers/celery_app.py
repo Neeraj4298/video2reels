@@ -18,10 +18,17 @@ from celery import Celery
 from celery.signals import worker_ready
 from kombu import Exchange, Queue
 
-# Ensure project root (/app) is on sys.path so `import api.*` works in all worker processes
-_ROOT_DIR = str(Path(__file__).resolve().parent.parent)
+# Ensure project root (/app) and local .venv site-packages are on sys.path in all worker processes
+_ROOT_PATH = Path(__file__).resolve().parent.parent
+_ROOT_DIR = str(_ROOT_PATH)
 if _ROOT_DIR not in sys.path:
     sys.path.insert(0, _ROOT_DIR)
+for _sp in sorted((_ROOT_PATH / ".venv" / "lib").glob("python*/site-packages")):
+    if _sp.is_dir() and str(_sp) not in sys.path:
+        sys.path.insert(1, str(_sp))
+for _b in (str(_ROOT_PATH / ".venv" / "bin"), str(_ROOT_PATH / "bin")):
+    if Path(_b).is_dir() and _b not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = f"{_b}{os.pathsep}{os.environ.get('PATH', '')}"
 
 # ── Build broker + backend URLs ───────────────────────────────────────────────
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")

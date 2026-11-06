@@ -6,7 +6,7 @@ anthropic>=0.34.0              # Claude API (fallback)
 
 # === Video / Audio / Vision ===
 yt-dlp>=2024.10.22             # URL downloading
-opencv-python>=4.10            # Frame extraction & processing
+opencv-python-headless>=4.10   # Frame extraction & processing (headless for Docker)
 mediapipe>=0.10.14             # Face detection
 scenedetect>=0.6.2             # Scene boundary cut detection
 pillow>=10.0.0                 # Image utilities

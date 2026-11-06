@@ -4,6 +4,20 @@ video2reels FastAPI application entry point.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import os
+from pathlib import Path
+import sys
+
+# Ensure project root and local .venv site-packages/bin are always active
+_ROOT_PATH = Path(__file__).resolve().parent.parent
+if str(_ROOT_PATH) not in sys.path:
+    sys.path.insert(0, str(_ROOT_PATH))
+for _sp in sorted((_ROOT_PATH / ".venv" / "lib").glob("python*/site-packages")):
+    if _sp.is_dir() and str(_sp) not in sys.path:
+        sys.path.insert(1, str(_sp))
+for _b in (str(_ROOT_PATH / ".venv" / "bin"), str(_ROOT_PATH / "bin")):
+    if Path(_b).is_dir() and _b not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = f"{_b}{os.pathsep}{os.environ.get('PATH', '')}"
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

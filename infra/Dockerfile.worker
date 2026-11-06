@@ -7,10 +7,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONPATH=/app
 
-# System deps: ffmpeg is the core tool used by all stages
+# System deps: ffmpeg is the core tool used by all stages + libgl1/libglib2.0-0 for OpenCV/MediaPipe
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         curl \
+        libgl1 \
+        libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

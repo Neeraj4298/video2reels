@@ -68,29 +68,29 @@ def _ffprobe_bin() -> str:
     raise RuntimeError("ffprobe not found.")
 
 
-def _ytdlp_bin() -> str:
-    """Return yt-dlp executable from active Python venv, project .venv, or system PATH.
-    Auto-installs yt-dlp if running in a container where the binary is missing.
-    """
+def _ytdlp_cmd() -> list[str]:
+    """Return command prefix to run yt-dlp reliably across host venvs and Docker."""
+    import importlib.util
     import sys
+    if importlib.util.find_spec("yt_dlp") is not None:
+        return [sys.executable, "-m", "yt_dlp"]
     for cand in (
         Path(sys.executable).resolve().parent / "yt-dlp",
         Path(__file__).resolve().parent.parent / ".venv" / "bin" / "yt-dlp",
     ):
         if cand.exists():
-            return str(cand)
+            return [str(cand)]
     sys_ytdlp = shutil.which("yt-dlp")
     if sys_ytdlp:
-        return sys_ytdlp
-    logger.warning("yt-dlp binary not found in PATH; installing yt-dlp via pip …")
+        return [sys_ytdlp]
+    logger.warning("yt-dlp not found; installing yt-dlp via pip …")
     subprocess.run(
         [sys.executable, "-m", "pip", "install", "--no-cache-dir", "--quiet", "yt-dlp"],
         check=False,
     )
-    installed = Path(sys.executable).resolve().parent / "yt-dlp"
-    if installed.exists():
-        return str(installed)
-    return shutil.which("yt-dlp") or "yt-dlp"
+    if importlib.util.find_spec("yt_dlp") is not None:
+        return [sys.executable, "-m", "yt_dlp"]
+    return [shutil.which("yt-dlp") or "yt-dlp"]
 
 
 # ── Core functions ────────────────────────────────────────────────────────────
@@ -101,7 +101,7 @@ def download_url(url: str, out_dir: Path) -> Path:
     template = str(out_dir / "%(title).60s.%(ext)s")
     ffmpeg_dir = str(Path(_ffmpeg_bin()).resolve().parent)
     cmd = [
-        _ytdlp_bin(),
+        *_ytdlp_cmd(),
         "--ffmpeg-location", ffmpeg_dir,
         "--restrict-filenames",
         "--hls-prefer-native",

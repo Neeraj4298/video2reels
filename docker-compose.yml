@@ -22,6 +22,8 @@ x-worker-base: &worker-base
     - ./workers:/app/workers
     - ./prompts:/app/prompts
     - ./models:/app/models
+    - ./bin:/app/bin:ro
+    - ./.venv/lib:/app/.venv/lib:ro
     - video_work:/tmp/video_work
     - whisper_cache:/root/.cache/huggingface
   depends_on:
