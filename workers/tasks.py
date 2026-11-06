@@ -66,43 +66,50 @@ DATABASE_URL = os.getenv(
 
 _engine = None
 _Session = None
+_active_sync_url: str | None = None
 
 
 def _get_session() -> Session:
     """Lazy-initialise a synchronous SQLAlchemy session (PostgreSQL primary, SQLite fallback)."""
-    global _engine, _Session
-    if _Session is None:
-        import socket
-        db_url = DATABASE_URL
-        reachable = False
-        for candidate_url in (db_url, db_url.replace("@postgres:", "@localhost:")):
-            try:
-                host_port = candidate_url.split("@")[-1].split("/")[0]
-                host = host_port.split(":")[0]
-                port = int(host_port.split(":")[1]) if ":" in host_port else 5432
-                sock = socket.socket()
-                sock.settimeout(0.5)
-                if sock.connect_ex((host, port)) == 0:
-                    reachable = True
-                    db_url = candidate_url
-                    sock.close()
-                    break
+    global _engine, _Session, _active_sync_url
+    import socket
+    db_url = DATABASE_URL
+    reachable = False
+    for candidate_url in (db_url, db_url.replace("@postgres:", "@localhost:")):
+        try:
+            host_port = candidate_url.split("@")[-1].split("/")[0]
+            host = host_port.split(":")[0]
+            port = int(host_port.split(":")[1]) if ":" in host_port else 5432
+            sock = socket.socket()
+            sock.settimeout(0.3)
+            if sock.connect_ex((host, port)) == 0:
+                reachable = True
+                db_url = candidate_url
                 sock.close()
-            except Exception:
-                pass
+                break
+            sock.close()
+        except Exception:
+            pass
 
-        if reachable:
-            _engine = create_engine(db_url, pool_pre_ping=True, pool_size=5)
-        else:
+    if not reachable:
+        db_path = Path(_ROOT_DIR) / "work" / "video2reels_local.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        desired_url = f"sqlite:///{db_path}"
+    else:
+        desired_url = db_url
+
+    if _Session is None or desired_url != _active_sync_url:
+        if desired_url.startswith("sqlite"):
             from api.db import Base
-            db_path = Path(_ROOT_DIR) / "work" / "video2reels_local.db"
-            db_path.parent.mkdir(parents=True, exist_ok=True)
             _engine = create_engine(
-                f"sqlite:///{db_path}",
+                desired_url,
                 connect_args={"check_same_thread": False},
             )
             Base.metadata.create_all(_engine)
+        else:
+            _engine = create_engine(desired_url, pool_pre_ping=True, pool_size=5)
         _Session = sessionmaker(bind=_engine)
+        _active_sync_url = desired_url
     return _Session()
 
 
@@ -448,15 +455,23 @@ def stage_ingest(
         work_dir = Path(tmpdir)
         try:
             # Determine source: MinIO key vs URL vs project source_url
-            source_input = video_storage_key
+            source_input = (video_storage_key or "").strip()
             if not source_input or (
                 not source_input.startswith(("http://", "https://"))
                 and not object_exists(cfg.bucket_originals, source_input)
             ):
-                with _get_session() as db:
-                    proj = db.get(Project, uuid.UUID(project_id))
-                    if proj and proj.source_url:
-                        source_input = proj.source_url
+                for _wait_idx in range(12):
+                    with _get_session() as db:
+                        proj = db.get(Project, uuid.UUID(project_id))
+                        if proj and proj.source_url:
+                            source_input = proj.source_url.strip()
+                            break
+                    if "pytest" in sys.modules:
+                        break
+                    time.sleep(0.25)
+
+            if not source_input:
+                raise ValueError(f"No source URL or uploaded video found for project {project_id}")
 
             if source_input.startswith("http://") or source_input.startswith("https://"):
                 # URL mode: ingest_video downloads with yt-dlp

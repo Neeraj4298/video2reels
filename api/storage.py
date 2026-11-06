@@ -89,6 +89,8 @@ def upload_bytes(bucket: str, key: str, data: bytes, content_type: str = "applic
 
 def download_file(bucket: str, key: str, dest: Path | str) -> Path:
     """Download an object from storage to a local path."""
+    if not key or not key.strip():
+        raise ValueError("Storage key cannot be empty")
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -96,7 +98,7 @@ def download_file(bucket: str, key: str, dest: Path | str) -> Path:
         client.fget_object(bucket, key, str(dest))
     except Exception:
         local_src = _local_object_path(bucket, key)
-        if local_src.exists():
+        if local_src.is_file():
             shutil.copy2(str(local_src), str(dest))
         else:
             raise
@@ -105,6 +107,8 @@ def download_file(bucket: str, key: str, dest: Path | str) -> Path:
 
 def download_bytes(bucket: str, key: str) -> bytes:
     """Download an object from storage as bytes."""
+    if not key or not key.strip():
+        raise ValueError("Storage key cannot be empty")
     try:
         client = get_client()
         response = client.get_object(bucket, key)
@@ -115,14 +119,14 @@ def download_bytes(bucket: str, key: str) -> bytes:
             response.release_conn()
     except Exception:
         local_src = _local_object_path(bucket, key)
-        if local_src.exists():
+        if local_src.is_file():
             return local_src.read_bytes()
         raise
 
 
 def presigned_get_url(bucket: str, key: str, ttl_seconds: int = 3600) -> str:
     """Generate a presigned GET URL (or local API streaming URL when MinIO is offline)."""
-    if not _is_minio_reachable() and _local_object_path(bucket, key).exists():
+    if not _is_minio_reachable() and bool(key) and _local_object_path(bucket, key).is_file():
         return f"http://localhost:8000/api/clips/storage/{bucket}/{key}"
     from datetime import timedelta
     client = _get_presign_client()
@@ -140,7 +144,9 @@ def presigned_put_url(bucket: str, key: str, ttl_seconds: int = 3600) -> str:
 
 def object_exists(bucket: str, key: str) -> bool:
     """Check if an object exists in storage."""
-    if _local_object_path(bucket, key).exists():
+    if not key or not key.strip():
+        return False
+    if _local_object_path(bucket, key).is_file():
         return True
     client = get_client()
     try:
@@ -149,14 +155,15 @@ def object_exists(bucket: str, key: str) -> bool:
     except S3Error:
         return False
     except Exception:
-        return _local_object_path(bucket, key).exists()
+        return _local_object_path(bucket, key).is_file()
 
 
 def delete_object(bucket: str, key: str) -> None:
     """Delete an object from storage."""
-    local_p = _local_object_path(bucket, key)
-    if local_p.exists():
-        local_p.unlink(missing_ok=True)
+    if key and key.strip():
+        local_p = _local_object_path(bucket, key)
+        if local_p.is_file():
+            local_p.unlink(missing_ok=True)
     client = get_client()
     try:
         client.remove_object(bucket, key)

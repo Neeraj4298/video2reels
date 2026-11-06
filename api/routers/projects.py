@@ -69,7 +69,13 @@ async def create_project(body: ProjectCreate, db: AsyncSession = Depends(get_db)
     # Create a queued job for stage tracking
     job = Job(project_id=project.id, stage="ingest", status=JobStatus.queued)
     db.add(job)
-    await db.flush()
+
+    if body.source_url:
+        project.status = ProjectStatus.processing
+
+    # Commit before dispatching so worker processes see the Project/Video/Job rows immediately
+    await db.commit()
+    await db.refresh(project)
 
     if body.source_url:
         # URL mode: dispatch pipeline immediately; ingest worker handles yt-dlp
@@ -77,7 +83,6 @@ async def create_project(body: ProjectCreate, db: AsyncSession = Depends(get_db)
             dispatch_pipeline(project.id, video_storage_key="", user_prompt=body.user_prompt)
         else:
             dispatch_pipeline(project.id, video_storage_key="")
-        project.status = ProjectStatus.processing
 
     return project
 

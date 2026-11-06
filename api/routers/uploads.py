@@ -122,7 +122,7 @@ async def confirm_upload(body: ConfirmRequest, db: AsyncSession = Depends(get_db
     if job:
         job.status = JobStatus.queued
 
-    await db.flush()
+    await db.commit()
     dispatch_pipeline(body.project_id, body.storage_key)
 
     return {"message": "Pipeline started", "project_id": str(body.project_id)}

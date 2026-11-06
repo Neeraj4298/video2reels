@@ -185,7 +185,7 @@ def validate_video(meta: VideoMeta) -> None:
         raise ValueError(f"Resolution too low: {meta.width}px wide.")
 
 
-def ingest(source: str, work_dir: Path) -> VideoMeta:
+def ingest(source: str | Path, work_dir: Path) -> VideoMeta:
     """
     Main entry point for Stage 1.
 
@@ -200,18 +200,19 @@ def ingest(source: str, work_dir: Path) -> VideoMeta:
     raw_dir = work_dir / "raw"
     raw_dir.mkdir(exist_ok=True)
 
-    if source.startswith("http://") or source.startswith("https://"):
+    source_str = str(source).strip()
+    if source_str.startswith("http://") or source_str.startswith("https://"):
         logger.info("[Stage 1] Downloading from URL …")
-        video_path = download_url(source, raw_dir)
+        video_path = download_url(source_str, raw_dir)
     else:
-        video_path = Path(source)
-        if not video_path.exists():
+        video_path = Path(source_str)
+        if not video_path.exists() or not video_path.is_file():
             raise FileNotFoundError(f"Input file not found: {video_path}")
         logger.info("[Stage 1] Using local file: {}", video_path)
 
     logger.info("[Stage 1] Probing video metadata …")
     meta = probe_video(video_path)
-    meta.source_url = source if source.startswith("http") else None
+    meta.source_url = source_str if source_str.startswith("http") else None
 
     logger.info(
         "[Stage 1] Validated: {}  |  {:.1f}s  |  {}x{}  |  {:.2f}fps  |  {:.1f}MB",

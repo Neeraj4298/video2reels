@@ -37,6 +37,7 @@ def _resolve_database_url(configured_url: str) -> str:
 
 settings = get_settings()
 _effective_db_url = _resolve_database_url(settings.database_url)
+_current_url: str | None = None
 
 try:
     if _effective_db_url.startswith("sqlite"):
@@ -60,15 +61,47 @@ try:
         autocommit=False,
         autoflush=False,
     )
+    _current_url = _effective_db_url
 except ModuleNotFoundError:
     # Sync Celery workers without asyncpg only import `Base` from `api.db`
     engine = None  # type: ignore[assignment]
     AsyncSessionLocal = None  # type: ignore[assignment]
 
 
+def _get_session_factory() -> async_sessionmaker[AsyncSession]:
+    """Return session factory, upgrading from SQLite fallback to PostgreSQL if port 5432 opens."""
+    global engine, AsyncSessionLocal, _current_url
+    desired_url = _resolve_database_url(settings.database_url)
+    if desired_url != _current_url or AsyncSessionLocal is None:
+        if desired_url.startswith("sqlite"):
+            engine = create_async_engine(
+                desired_url,
+                echo=settings.debug,
+                connect_args={"check_same_thread": False},
+            )
+        else:
+            engine = create_async_engine(
+                desired_url,
+                echo=settings.debug,
+                pool_size=10,
+                max_overflow=20,
+                pool_pre_ping=True,
+            )
+        AsyncSessionLocal = async_sessionmaker(
+            bind=engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+            autocommit=False,
+            autoflush=False,
+        )
+        _current_url = desired_url
+    return AsyncSessionLocal
+
+
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """FastAPI dependency: yields a DB session and handles cleanup."""
-    async with AsyncSessionLocal() as session:
+    factory = _get_session_factory()
+    async with factory() as session:
         try:
             yield session
             await session.commit()

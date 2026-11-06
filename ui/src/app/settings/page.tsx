@@ -188,10 +188,10 @@ export default function SettingsPage() {
                   ["Reframing", "MediaPipe BlazeFace · PySceneDetect · Kalman + EMA smoothing"],
                   ["Export", "FFmpeg H.264 1080×1920 @ 30fps + Brand Kit Watermark"],
                 ].map(([label, value]) => (
-                  <>
-                    <span key={`l-${label}`} style={{ color: "var(--text-muted)", fontWeight: 500 }}>{label}</span>
-                    <span key={`v-${label}`} style={{ color: "var(--text-secondary)" }}>{value}</span>
-                  </>
+                  <div key={label} style={{ display: "contents" }}>
+                    <span style={{ color: "var(--text-muted)", fontWeight: 500 }}>{label}</span>
+                    <span style={{ color: "var(--text-secondary)" }}>{value}</span>
+                  </div>
                 ))}
               </div>
             </div>
