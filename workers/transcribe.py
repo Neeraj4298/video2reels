@@ -37,6 +37,8 @@ class Word:
     start: float
     end: float
     probability: float
+    id: str = ""
+    speaker: Optional[str] = None
 
 
 @dataclass
@@ -55,7 +57,49 @@ class Transcript:
     duration: float
     segments: list[Segment] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        self.ensure_word_ids()
+
+    def ensure_word_ids(self) -> None:
+        """Assign deterministic stable IDs (w_000001, w_000002, ...) to all words."""
+        counter = 1
+        for seg in self.segments:
+            for w in seg.words:
+                if not w.id:
+                    w.id = f"w_{counter:06d}"
+                if not w.speaker and seg.speaker:
+                    w.speaker = seg.speaker
+                counter += 1
+
+    def word_by_id(self, word_id: str) -> Optional[Word]:
+        """Look up a Word by its stable ID (e.g., 'w_000001' or '1')."""
+        norm = word_id.strip()
+        if norm.isdigit():
+            norm = f"w_{int(norm):06d}"
+        for w in self.all_words:
+            if w.id == norm:
+                return w
+        return None
+
+    def words_in_id_range(self, start_word_id: str, end_word_id: str) -> list[Word]:
+        """Return all words inclusive between start_word_id and end_word_id."""
+        self.ensure_word_ids()
+        w_start = self.word_by_id(start_word_id)
+        w_end = self.word_by_id(end_word_id)
+        if not w_start or not w_end:
+            return []
+        all_w = self.all_words
+        try:
+            i_start = all_w.index(w_start)
+            i_end = all_w.index(w_end)
+        except ValueError:
+            return []
+        if i_start > i_end:
+            i_start, i_end = i_end, i_start
+        return all_w[i_start : i_end + 1]
+
     def to_dict(self) -> dict:
+        self.ensure_word_ids()
         return {
             "language": self.language,
             "language_probability": self.language_probability,
@@ -68,10 +112,12 @@ class Transcript:
                     "speaker": s.speaker,
                     "words": [
                         {
+                            "id": w.id,
                             "w": w.text,
                             "s": round(w.start, 3),
                             "e": round(w.end, 3),
                             "p": round(w.probability, 3),
+                            **({"speaker": w.speaker} if w.speaker else {}),
                         }
                         for w in s.words
                     ],
@@ -84,8 +130,16 @@ class Transcript:
     def from_dict(cls, data: dict) -> "Transcript":
         segments = []
         for s in data.get("segments", []):
+            seg_speaker = s.get("speaker")
             words = [
-                Word(text=w["w"], start=w["s"], end=w["e"], probability=w["p"])
+                Word(
+                    text=w["w"],
+                    start=w["s"],
+                    end=w["e"],
+                    probability=w.get("p", 1.0),
+                    id=w.get("id", ""),
+                    speaker=w.get("speaker") or seg_speaker,
+                )
                 for w in s.get("words", [])
             ]
             segments.append(
@@ -94,15 +148,18 @@ class Transcript:
                     end=s["end"],
                     text=s["text"],
                     words=words,
-                    speaker=s.get("speaker"),
+                    speaker=seg_speaker,
                 )
             )
-        return cls(
+        t = cls(
             language=data["language"],
             language_probability=data.get("language_probability", 1.0),
             duration=data["duration"],
             segments=segments,
         )
+        t.ensure_word_ids()
+        return t
+
 
     @property
     def full_text(self) -> str:
@@ -226,57 +283,58 @@ def diarize_transcript(
     return transcript
 
 
-def _fallback_transcript_from_wav(audio_path: Path) -> Transcript:
-    """
-    Zero-dependency fallback using Python's built-in `wave` module if faster-whisper
-    cannot be installed or loaded in a constrained container environment.
-    """
-    duration = 60.0
-    try:
-        with wave.open(str(audio_path), "rb") as wf:
-            frames = wf.getnframes()
-            rate = wf.getframerate() or 16000
-            duration = max(10.0, float(frames) / float(rate))
-    except Exception:
-        pass
+def _parse_srt_timestamp(ts: str) -> float:
+    """Parse HH:MM:SS,mmm or HH:MM:SS.mmm into seconds."""
+    ts = ts.strip().replace(",", ".")
+    parts = ts.split(":")
+    if len(parts) != 3:
+        raise ValueError(f"Invalid SRT timestamp: {ts!r}")
+    return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
 
+
+def transcript_from_srt(srt_text: str, language: str = "en") -> Transcript:
+    """
+    Build a word-indexed Transcript from a user-uploaded .srt subtitle file override.
+    Interpolates word timings proportionally across each subtitle cue and assigns stable IDs.
+    """
+    import re
+    blocks = re.split(r"\n\s*\n", srt_text.strip())
     segments: list[Segment] = []
-    t = 0.0
-    idx = 1
-    while t < duration:
-        end_t = min(duration, t + 6.0)
-        if end_t - t < 1.0:
-            break
-        phrase = f"Spoken highlight segment {idx} from video."
-        words_raw = phrase.split()
-        w_dur = (end_t - t) / max(1, len(words_raw))
+    max_end = 0.0
+
+    for block in blocks:
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+        if len(lines) < 2:
+            continue
+        time_line_idx = 0
+        if "-->" not in lines[0] and len(lines) >= 3 and "-->" in lines[1]:
+            time_line_idx = 1
+        if "-->" not in lines[time_line_idx]:
+            continue
+        start_s, end_s = lines[time_line_idx].split("-->", 1)
+        seg_start = _parse_srt_timestamp(start_s)
+        seg_end = max(seg_start + 0.05, _parse_srt_timestamp(end_s))
+        text = " ".join(lines[time_line_idx + 1 :]).strip()
+        if not text:
+            continue
+        tokens = text.split()
+        dur = max(0.05, seg_end - seg_start)
+        step = dur / max(1, len(tokens))
         words = [
             Word(
-                text=w_str,
-                start=round(t + i * w_dur, 3),
-                end=round(t + (i + 1) * w_dur, 3),
-                probability=0.95,
+                text=tok,
+                start=round(seg_start + i * step, 3),
+                end=round(seg_start + (i + 1) * step, 3),
+                probability=1.0,
             )
-            for i, w_str in enumerate(words_raw)
+            for i, tok in enumerate(tokens)
         ]
-        segments.append(
-            Segment(
-                start=round(t, 3),
-                end=round(end_t, 3),
-                text=phrase,
-                words=words,
-                speaker="S1" if idx % 2 == 1 else "S2",
-            )
-        )
-        t = end_t + 0.2
-        idx += 1
+        segments.append(Segment(start=seg_start, end=seg_end, text=text, words=words, speaker="S1"))
+        max_end = max(max_end, seg_end)
 
-    return Transcript(
-        language="en",
-        language_probability=1.0,
-        duration=round(duration, 3),
-        segments=segments,
-    )
+    t = Transcript(language=language, language_probability=1.0, duration=round(max_end, 3), segments=segments)
+    t.ensure_word_ids()
+    return t
 
 
 # ── Core function ─────────────────────────────────────────────────────────────
@@ -284,21 +342,25 @@ def _fallback_transcript_from_wav(audio_path: Path) -> Transcript:
 def transcribe(
     audio_path: Path,
     work_dir: Path,
-    progress_callback: Optional[ Any ] = None,
+    progress_callback: Optional[Any] = None,
+    srt_override: Optional[str] = None,
+    custom_vocabulary: Optional[list[str]] = None,
 ) -> Transcript:
     """
     Transcribe audio using faster-whisper with word-level timestamps.
-
-    Args:
-        audio_path: path to the 16kHz mono WAV (output of Stage 2)
-        work_dir:   project scratch dir — transcript.json cached here
-
-    Returns:
-        Transcript dataclass
+    Fails loudly if the ASR model is unavailable instead of fabricating a transcript.
     """
     transcript_dir = work_dir / "transcripts"
     transcript_dir.mkdir(parents=True, exist_ok=True)
     cache_path = transcript_dir / "transcript.json"
+
+    if srt_override and srt_override.strip():
+        logger.info("[Stage 3] Building transcript from user .srt override")
+        transcript = transcript_from_srt(srt_override)
+        diarize_segments(transcript.segments, audio_path=audio_path)
+        transcript.ensure_word_ids()
+        cache_path.write_text(json.dumps(transcript.to_dict(), indent=2, ensure_ascii=False))
+        return transcript
 
     # ── Cache hit ─────────────────────────────────────────────────────────────
     if cache_path.exists():
@@ -311,33 +373,21 @@ def transcribe(
         )
         return t
 
-    # ── Run faster-whisper (auto-install if missing in container) ─────────────
-    WhisperModel = None
+    # ── Run faster-whisper (fail loudly if unavailable) ───────────────────────
     try:
-        from faster_whisper import WhisperModel as _WM
-        WhisperModel = _WM
-    except ImportError:
-        logger.warning("[Stage 3] faster-whisper not found; auto-installing via uv/pip …")
-        import shutil
-        uv_bin = shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
-        if Path(uv_bin).exists():
-            subprocess.run(
-                [uv_bin, "pip", "install", "--python", sys.executable, "--quiet", "faster-whisper==1.1.1", "numpy"],
-                check=False,
-            )
-        else:
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--no-cache-dir", "--quiet", "faster-whisper==1.1.1", "numpy"],
-                check=False,
-            )
-        try:
-            from faster_whisper import WhisperModel as _WM
-            WhisperModel = _WM
-        except ImportError as e:
-            logger.warning("[Stage 3] faster-whisper unavailable ({}); using WAV fallback transcript", e)
-            transcript = _fallback_transcript_from_wav(audio_path)
-            cache_path.write_text(json.dumps(transcript.to_dict(), indent=2, ensure_ascii=False))
-            return transcript
+        from faster_whisper import WhisperModel
+    except ImportError as e:
+        raise RuntimeError(
+            f"ASR backend 'faster-whisper' is not installed ({e}). "
+            "Refusing to fabricate a synthetic transcript — install faster-whisper or provide an .srt override."
+        ) from e
+
+    initial_prompt = None
+    if custom_vocabulary:
+        clean_vocab = [v.strip() for v in custom_vocabulary if v and v.strip()]
+        if clean_vocab:
+            initial_prompt = "Vocabulary: " + ", ".join(clean_vocab)
+
 
     logger.info(
         "[Stage 3] Loading Whisper model '{}' on primary device={} (compute={})",

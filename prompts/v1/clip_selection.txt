@@ -20,6 +20,8 @@ Return ONLY valid JSON — no explanation, no markdown:
 {
   "clips": [
     {
+      "start_word_id": "<word id e.g. w_000001>",
+      "end_word_id": "<word id e.g. w_000085>",
       "start": <float seconds>,
       "end": <float seconds>,
       "hook": "<first sentence of the clip>",
@@ -32,6 +34,7 @@ Return ONLY valid JSON — no explanation, no markdown:
     }
   ]
 }
+
 
 RULES:
 - Return between 5 and {TOP_N} clips

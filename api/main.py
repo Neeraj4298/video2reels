@@ -24,8 +24,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.config import get_settings
 from api.db import engine, Base
-from api.routers import projects, clips, uploads, brand_kits
+from api.routers import projects, clips, uploads, brand_kits, platform
 from api.schemas import HealthResponse
+
 
 _settings = get_settings()
 
@@ -108,6 +109,8 @@ app.include_router(projects.router)
 app.include_router(clips.router)
 app.include_router(uploads.router)
 app.include_router(brand_kits.router)
+app.include_router(platform.router)
+
 
 
 # ── Health check ──────────────────────────────────────────────────────────────

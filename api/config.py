@@ -42,11 +42,13 @@ class Settings(BaseSettings):
 
     # ── API ───────────────────────────────────────────────────────────────────
     api_title: str = "video2reels API"
-    api_version: str = "0.2.0"
+    api_version: str = "2.1.0"
     debug: bool = False
+    allow_local_storage_routes: bool = True
 
     # Signed URL expiry (seconds)
     presigned_url_ttl: int = 3600
+
 
 
 @lru_cache

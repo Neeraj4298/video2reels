@@ -52,6 +52,9 @@ class Clip:
     reason: str
     description: str = ""
     hashtags: list[str] = field(default_factory=list)
+    start_word_id: str = ""
+    end_word_id: str = ""
+    low_confidence: bool = False
 
     @property
     def duration(self) -> float:
@@ -74,6 +77,9 @@ class Clip:
             "reason": self.reason,
             "description": self.description,
             "hashtags": self.hashtags,
+            "start_word_id": self.start_word_id,
+            "end_word_id": self.end_word_id,
+            "low_confidence": self.low_confidence,
         }
 
     @classmethod
@@ -96,7 +102,11 @@ class Clip:
             reason=str(data.get("reason", "")),
             description=str(data.get("description", "")),
             hashtags=tags,
+            start_word_id=str(data.get("start_word_id", "")),
+            end_word_id=str(data.get("end_word_id", "")),
+            low_confidence=bool(data.get("low_confidence", False)),
         )
+
 
 
 # ── Pass A: Topic & Turn Segmentation ─────────────────────────────────────────
@@ -185,8 +195,12 @@ def segment_transcript(
 
 def _format_segment_line(index: int, seg: Segment) -> str:
     speaker_prefix = f"({seg.speaker}) " if seg.speaker else ""
+    word_range = ""
+    if seg.words and seg.words[0].id and seg.words[-1].id:
+        word_range = f" [{seg.words[0].id}..{seg.words[-1].id}]"
     clean_text = re.sub(r"(\S+)(?:\s+\1){4,}", r"\1", seg.text.strip())[:300]
-    return f"[{index:04d}] {seg.start:.2f}s–{seg.end:.2f}s: {speaker_prefix}{clean_text}"
+    return f"[{index:04d}] {seg.start:.2f}s–{seg.end:.2f}s{word_range}: {speaker_prefix}{clean_text}"
+
 
 
 def _format_transcript_for_llm(transcript: Transcript, max_chars: int = 80_000) -> str:
@@ -463,39 +477,134 @@ def compute_hook_score(hook_text: str, opening_text: str = "") -> float:
     return round(max(0.0, min(100.0, score)), 2)
 
 
+_DEPENDENT_CLAUSE_PATTERNS = re.compile(
+    r"^(?:because|and\s+so|so\s+that|which\s+is|therefore|however|moreover|furthermore|although|whereas|unless)\b",
+    re.IGNORECASE,
+)
+
+
+def starts_with_dependent_clause(text: str) -> bool:
+    """Return True if a clip's opening phrase starts with a dependent clause or conjunction."""
+    cleaned = re.sub(r"^[^A-Za-z0-9]+", "", (text or "").strip())
+    return bool(_DEPENDENT_CLAUSE_PATTERNS.match(cleaned))
+
+
+def refine_clip_boundaries(
+    start: float,
+    end: float,
+    transcript: Transcript,
+) -> tuple[float, float, str, str]:
+    """
+    Refine clip boundaries using exact word IDs, sentence boundaries, and dependent-clause rejection.
+    Returns (refined_start, refined_end, start_word_id, end_word_id).
+    """
+    transcript.ensure_word_ids()
+    all_words = transcript.all_words
+    if not all_words:
+        return start, end, "", ""
+
+    # Locate first and last word within [start, end]
+    in_range = [w for w in all_words if w.end >= start and w.start <= end]
+    if not in_range:
+        # Nearest word fallback
+        first_w = min(all_words, key=lambda w: abs(w.start - start))
+        last_w = min(all_words, key=lambda w: abs(w.end - end))
+    else:
+        first_w = in_range[0]
+        last_w = in_range[-1]
+
+    # If the opening word starts a dependent clause ("Because...", "And so..."),
+    # walk backward to the previous sentence boundary if within 4.0s
+    idx_first = all_words.index(first_w)
+    opening_phrase = " ".join(w.text.strip() for w in all_words[idx_first : idx_first + 3])
+    if starts_with_dependent_clause(opening_phrase) and idx_first > 0:
+        for back_idx in range(idx_first - 1, max(-1, idx_first - 15), -1):
+            prev_w = all_words[back_idx]
+            if (first_w.start - prev_w.start) > 4.5:
+                break
+            if back_idx == 0 or re.search(r"[.!?][\"']?$", all_words[back_idx - 1].text.strip()):
+                first_w = prev_w
+                break
+
+    return first_w.start, last_w.end, first_w.id, last_w.id
+
+
+def calibrate_blend_weights(
+    feedback_events: list[dict[str, Any]],
+) -> dict[str, float]:
+    """
+    Learn calibrated Virality Score blend weights from human feedback events
+    (kept, exported, published vs. rejected, trimmed) instead of static 60/15/15/10.
+    """
+    default_weights = {"llm": 0.60, "energy": 0.15, "sentiment": 0.15, "hook": 0.10}
+    if not feedback_events:
+        return default_weights
+
+    pos_actions = {"kept", "exported", "published"}
+    neg_actions = {"rejected"}
+    pos_events = [e for e in feedback_events if str(e.get("action", "")).lower() in pos_actions]
+    neg_events = [e for e in feedback_events if str(e.get("action", "")).lower() in neg_actions]
+    if not pos_events:
+        return default_weights
+
+    # Boost signals that correlate with accepted clips
+    w_llm = 0.60
+    w_energy = 0.15
+    w_sentiment = 0.15
+    w_hook = 0.10
+
+    for ev in pos_events:
+        sb = ev.get("score_breakdown") or {}
+        if float(sb.get("hook", 7)) >= 8:
+            w_hook += 0.015
+        if float(sb.get("flow", 7)) >= 8:
+            w_energy += 0.01
+        if float(sb.get("value", 7)) >= 8:
+            w_sentiment += 0.01
+
+    for ev in neg_events:
+        w_llm = max(0.40, w_llm - 0.01)
+
+    total = w_llm + w_energy + w_sentiment + w_hook
+    return {
+        "llm": round(w_llm / total, 4),
+        "energy": round(w_energy / total, 4),
+        "sentiment": round(w_sentiment / total, 4),
+        "hook": round(w_hook / total, 4),
+    }
+
+
 def compute_blended_score(
     llm_score: float,
     clip_start: float,
     clip_end: float,
     hook_text: str,
     transcript: Transcript,
+    weights: Optional[dict[str, float]] = None,
 ) -> int:
     """
-    Combine LLM virality score with speech energy, emotional sentiment, and hook pattern:
-        final_score = (
-            llm_score       * 0.60 +
-            energy_score    * 0.15 +
-            sentiment_score * 0.15 +
-            hook_score      * 0.10
-        )
+    Combine LLM virality score with speech energy, emotional sentiment, and hook pattern.
+    Supports calibrated weights learned from feedback_events (defaults to 60/15/15/10).
     """
+    w = weights or {"llm": 0.60, "energy": 0.15, "sentiment": 0.15, "hook": 0.10}
     all_words = transcript.all_words
-    clip_words = [w for w in all_words if clip_start <= w.start <= clip_end]
-    clip_text = " ".join(w.text.strip() for w in clip_words)
-    opening_words = [w for w in clip_words if w.start <= clip_start + 5.0]
-    opening_text = " ".join(w.text.strip() for w in opening_words)
+    clip_words = [word for word in all_words if clip_start <= word.start <= clip_end]
+    clip_text = " ".join(word.text.strip() for word in clip_words)
+    opening_words = [word for word in clip_words if word.start <= clip_start + 5.0]
+    opening_text = " ".join(word.text.strip() for word in opening_words)
 
     energy = compute_energy_score(clip_start, clip_end, all_words)
     sentiment = compute_sentiment_score(clip_text or hook_text)
     hook = compute_hook_score(hook_text, opening_text)
 
     blended = (
-        float(llm_score) * 0.60
-        + energy * 0.15
-        + sentiment * 0.15
-        + hook * 0.10
+        float(llm_score) * float(w.get("llm", 0.60))
+        + energy * float(w.get("energy", 0.15))
+        + sentiment * float(w.get("sentiment", 0.15))
+        + hook * float(w.get("hook", 0.10))
     )
     return int(max(0, min(100, round(blended))))
+
 
 
 # ── Post-LLM Critic Pass (v2) ─────────────────────────────────────────────────
@@ -668,8 +777,11 @@ def _heuristic_select_clips(
                 })
             t_cur += win_dur + 5.0
 
+    for cand in candidates:
+        cand["low_confidence"] = True
     candidates.sort(key=lambda c: c["score"], reverse=True)
     return candidates[:TOP_N_CLIPS]
+
 
 def _remove_overlapping(clips: list[Clip]) -> list[Clip]:
     """Remove overlapping clips, keeping the one with the higher score."""
@@ -789,20 +901,28 @@ def select_clips(
     all_words = transcript.all_words
     valid_start_times = {round(w.start, 1) for w in all_words}
 
-    def _build_clips_from_raw(candidates_list: list[dict[str, Any]]) -> list[Clip]:
+    def _build_clips_from_raw(candidates_list: list[dict[str, Any]], is_fallback: bool = False) -> list[Clip]:
         built: list[Clip] = []
         for rc in candidates_list:
             try:
-                start = float(rc["start"])
-                end = float(rc["end"])
+                start_wid = str(rc.get("start_word_id") or "").strip()
+                end_wid = str(rc.get("end_word_id") or "").strip()
+                w_start_obj = transcript.word_by_id(start_wid) if start_wid else None
+                w_end_obj = transcript.word_by_id(end_wid) if end_wid else None
 
-                # Validate timestamps exist in transcript (within 2s tolerance)
-                if valid_start_times and not any(abs(t - start) < 2.0 for t in valid_start_times):
-                    logger.warning(
-                        "[Stage 4] Skipping clip {:.1f}s — start time not in transcript",
-                        start,
-                    )
-                    continue
+                if w_start_obj and w_end_obj:
+                    start = w_start_obj.start
+                    end = w_end_obj.end
+                else:
+                    start = float(rc["start"])
+                    end = float(rc["end"])
+                    # Validate timestamps exist in transcript (within 2s tolerance)
+                    if valid_start_times and not any(abs(t - start) < 2.0 for t in valid_start_times):
+                        logger.warning(
+                            "[Stage 4] Skipping clip {:.1f}s — start time not in transcript",
+                            start,
+                        )
+                        continue
 
                 # Validate duration constraints
                 duration = end - start
@@ -812,6 +932,13 @@ def select_clips(
                         start, end, duration,
                     )
                     continue
+
+                # Refine boundaries (dependent clause check + word ID resolution)
+                _, _, resolved_start_wid, resolved_end_wid = refine_clip_boundaries(start, end, transcript)
+                if not start_wid:
+                    start_wid = resolved_start_wid
+                if not end_wid:
+                    end_wid = resolved_end_wid
 
                 # Snap to word boundaries
                 start, end = _snap_to_word_boundary(start, end, all_words)
@@ -844,6 +971,9 @@ def select_clips(
                     reason=rc.get("reason", ""),
                     description=rc.get("description", ""),
                     hashtags=tags,
+                    start_word_id=start_wid,
+                    end_word_id=end_wid,
+                    low_confidence=bool(rc.get("low_confidence", is_fallback)),
                 ))
             except (KeyError, ValueError, TypeError) as e:
                 logger.warning("[Stage 4] Skipping malformed clip: {} — {}", rc, e)
@@ -852,7 +982,10 @@ def select_clips(
     clips = _build_clips_from_raw(raw_clips)
     if not clips and transcript.duration >= CLIP_MIN_DURATION:
         fallback_raw = _heuristic_select_clips(transcript, user_prompt=user_prompt)
-        clips = _build_clips_from_raw(fallback_raw)
+        for fc in fallback_raw:
+            fc["low_confidence"] = True
+        clips = _build_clips_from_raw(fallback_raw, is_fallback=True)
+
 
     # ── Deduplicate, optional critic pass, & rank ─────────────────────────────
     clips = _remove_overlapping(clips)

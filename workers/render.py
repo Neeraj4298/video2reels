@@ -50,7 +50,27 @@ class RenderResult:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def escape_ffmpeg_filter_path(path: Path | str) -> str:
+    """
+    Escape a filesystem path for safe embedding inside FFmpeg filter arguments
+    such as ass='...' or sendcmd=f='...'.
+    """
+    raw = str(path)
+    # In FFmpeg filtergraphs, backslashes, colons, single quotes, and brackets must be escaped
+    escaped = (
+        raw.replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+    )
+    return escaped
+
+
 def _slugify(text: str, max_len: int = 40) -> str:
+
     """Convert title to a safe filename slug."""
     slug = re.sub(r"[^\w\s-]", "", text.lower())
     slug = re.sub(r"[\s_-]+", "_", slug).strip("_")
@@ -106,8 +126,11 @@ def _build_ffmpeg_cmd(
     from workers.reframe import build_blur_bg_filter_complex, build_split_screen_filter_complex
 
     ffmpeg = _ffmpeg_bin()
-    af = "loudnorm=I=-14:TP=-2:LRA=11"
+    clip_dur = max(0.1, float(clip.end - clip.start))
+    fade_out_st = max(0.0, clip_dur - 0.015)
+    af = f"afade=t=in:st=0:d=0.015,afade=t=out:st={fade_out_st:.3f}:d=0.015,loudnorm=I=-14:TP=-2:LRA=11"
     layout = getattr(reframe, "layout", "vertical")
+
 
     # If watermark is provided, pass it as second input
     has_watermark = watermark_path is not None and watermark_path.exists()
@@ -176,7 +199,8 @@ def _build_ffmpeg_cmd(
         crop_filter = f"crop={reframe.crop_w}:{reframe.crop_h}:(in_w-out_w)/2:0"
 
     scale_filter = f"scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:flags=lanczos"
-    ass_filter   = f"ass='{str(ass_path)}'"
+    ass_filter   = f"ass='{escape_ffmpeg_filter_path(ass_path)}'"
+
 
     if has_watermark:
         filter_complex = (
@@ -233,22 +257,11 @@ def render_clip(
     clip_index: int,
     style: CaptionStyle = DEFAULT_STYLE,
     watermark_path: Optional[Path] = None,
+    excluded_word_indices: Optional[list[int | str] | set[int | str]] = None,
+    word_overrides: Optional[dict[str | int, str]] = None,
 ) -> RenderResult:
     """
     Render a single clip to 1080×1920 MP4.
-
-    Args:
-        clip:        Clip (start/end/title)
-        reframe:     ReframeResult from Stage 5
-        transcript:  Full transcript for caption generation
-        meta:        Source video metadata (resolution, fps)
-        work_dir:    Project scratch dir
-        project_id:  Used to name the output directory
-        clip_index:  1-based clip number for filename
-        style:       Caption visual style
-
-    Returns:
-        RenderResult with output path and stats
     """
     out_dir = OUTPUT_DIR / project_id
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -257,7 +270,8 @@ def render_clip(
     out_filename = f"clip_{clip_index:02d}_{slug}.mp4"
     out_path = out_dir / out_filename
 
-    if out_path.exists():
+    has_edits = bool(excluded_word_indices) or bool(word_overrides)
+    if out_path.exists() and not has_edits:
         logger.info("[Stage 6b] Clip {} already rendered: {}", clip_index, out_path.name)
         size = out_path.stat().st_size
         return RenderResult(
@@ -267,7 +281,15 @@ def render_clip(
         )
 
     # ── Generate captions ─────────────────────────────────────────────────────
-    ass_path = generate_captions(clip, transcript, work_dir, style)
+    ass_path = generate_captions(
+        clip,
+        transcript,
+        work_dir,
+        style,
+        excluded_word_indices=excluded_word_indices,
+        word_overrides=word_overrides,
+    )
+
 
     # ── Build & run FFmpeg ────────────────────────────────────────────────────
     cmd = _build_ffmpeg_cmd(

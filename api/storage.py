@@ -18,10 +18,44 @@ _settings = get_settings()
 _LOCAL_STORAGE_ROOT = Path(__file__).resolve().parent.parent / "work" / "local_storage"
 
 
+def sanitize_storage_key(bucket: str, key: str) -> tuple[str, str]:
+    """
+    Validate and sanitize bucket and object key to prevent directory traversal (..),
+    null-byte injection, and absolute path escapes.
+    """
+    if not bucket or not isinstance(bucket, str) or not bucket.strip():
+        raise ValueError("Storage bucket cannot be empty")
+    if not key or not isinstance(key, str) or not key.strip():
+        raise ValueError("Storage key cannot be empty")
+
+    clean_bucket = bucket.strip().strip("/")
+    clean_key = key.strip().lstrip("/")
+
+    if "\x00" in clean_bucket or "\x00" in clean_key:
+        raise ValueError("Storage path contains null byte")
+    if "/" in clean_bucket or "\\" in clean_bucket or clean_bucket in (".", ".."):
+        raise ValueError(f"Invalid bucket name: {bucket!r}")
+
+    key_parts = Path(clean_key).parts
+    if not key_parts or any(part in ("..", ".", "") or "\\" in part for part in key_parts):
+        raise ValueError(f"Invalid or unsafe storage key: {key!r}")
+
+    root_resolved = _LOCAL_STORAGE_ROOT.resolve()
+    target_resolved = (_LOCAL_STORAGE_ROOT / clean_bucket / clean_key).resolve()
+    try:
+        target_resolved.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ValueError(f"Storage key escapes storage root: {key!r}") from exc
+
+    return clean_bucket, clean_key
+
+
 def _local_object_path(bucket: str, key: str) -> Path:
-    p = _LOCAL_STORAGE_ROOT / bucket / key
+    clean_bucket, clean_key = sanitize_storage_key(bucket, key)
+    p = _LOCAL_STORAGE_ROOT / clean_bucket / clean_key
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
+
 
 
 def _is_minio_reachable() -> bool:

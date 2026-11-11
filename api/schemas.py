@@ -70,13 +70,18 @@ class ClipUpdate(BaseModel):
     hashtags: list[str] | None = None
     selected: bool | None = None
     caption_style: dict | None = None
+    excluded_word_indices: list[int] | None = None
+    word_overrides: dict[str, str] | None = None
+    edl: dict[str, Any] | None = None
 
 
 class WordRead(BaseModel):
+    id: str | None = None
     w: str
     s: float
     e: float
     p: float = 1.0
+    speaker: str | None = None
 
 
 class ClipTranscriptRead(BaseModel):
@@ -85,6 +90,9 @@ class ClipTranscriptRead(BaseModel):
     end: float
     words: list[WordRead]
     text: str
+    excluded_word_indices: list[int] = []
+    word_overrides: dict[str, str] = {}
+
 
 
 class ClipMetadataResponse(BaseModel):
@@ -116,6 +124,9 @@ class RenderSettingsRead(OrmBase):
     layout: str
     caption_style: dict | None
     crop_keyframes: dict | None
+    excluded_word_indices: list[int] | None = None
+    word_overrides: dict[str, str] | None = None
+    edl: dict[str, Any] | None = None
     brand_kit_id: uuid.UUID | None
 
 
@@ -123,6 +134,18 @@ class RenderRequest(BaseModel):
     layout: str = "vertical"
     caption_style: dict | None = None
     brand_kit_id: uuid.UUID | None = None
+    excluded_word_indices: list[int] | None = None
+    word_overrides: dict[str, str] | None = None
+    edl: dict[str, Any] | None = None
+
+
+class EDLUpdateRequest(BaseModel):
+    layout: str | None = None
+    caption_style: dict[str, Any] | None = None
+    excluded_word_indices: list[int] | None = None
+    word_overrides: dict[str, str] | None = None
+    edl: dict[str, Any] | None = None
+
 
 
 # ── Renders ───────────────────────────────────────────────────────────────────

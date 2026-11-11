@@ -392,7 +392,7 @@ def select_primary_face(
 ) -> Optional[dict[str, Any]]:
     """
     Select the primary speaker face among detected candidates.
-    Balances face area (prominence) with distance to previously tracked subject (continuity).
+    Balances face area (prominence), speaking probability (ASD), and continuity.
     """
     if not faces:
         return None
@@ -405,18 +405,132 @@ def select_primary_face(
     for f in faces:
         area = f["w"] * f["h"]
         cx = f["center_x"]
+        speaking_prob = float(f.get("speaking_prob", 0.5))
 
         # Continuity penalty (if we were already tracking a subject)
         dist_prev = abs(cx - prev_center_x) / src_w if prev_center_x is not None else 0.0
         # Centering bias (faces near horizontal center are more likely the main subject)
         dist_center = abs(cx - (src_w / 2.0)) / src_w
 
-        score = area * (1.0 - 0.35 * dist_prev - 0.15 * dist_center)
+        score = area * (0.65 + 0.70 * speaking_prob) * (1.0 - 0.35 * dist_prev - 0.15 * dist_center)
         if score > best_score:
             best_score = score
             best_face = f
 
     return best_face
+
+
+def select_active_speaker_face(
+    faces: list[dict[str, Any]],
+    current_time: float,
+    prev_face: Optional[dict[str, Any]] = None,
+    last_switch_time: float = -10.0,
+    hysteresis_sec: float = 1.5,
+    diarized_speaker: Optional[str] = None,
+    src_w: int = 1920,
+) -> tuple[Optional[dict[str, Any]], float]:
+    """
+    Fuse diarization, ASD (speaking_prob), and face tracks to pick the active speaker,
+    enforcing a 1.5s hysteresis hold so the virtual camera does not ping-pong between speakers.
+    Returns (selected_face, updated_last_switch_time).
+    """
+    if not faces:
+        return None, last_switch_time
+    if len(faces) == 1:
+        return faces[0], last_switch_time
+
+    # Map diarized speaker ("S1" -> left/first speaker, "S2" -> right/second speaker) as a prior
+    sorted_by_x = sorted(faces, key=lambda f: f["center_x"])
+    for idx, f in enumerate(sorted_by_x):
+        inferred_label = f"S{idx + 1}"
+        base_prob = float(f.get("speaking_prob", 0.5))
+        if diarized_speaker and diarized_speaker == inferred_label:
+            f = dict(f)
+            f["speaking_prob"] = min(1.0, base_prob + 0.35)
+            sorted_by_x[idx] = f
+
+    prev_cx = prev_face["center_x"] if prev_face else None
+    candidate = select_primary_face(sorted_by_x, prev_center_x=prev_cx, src_w=src_w)
+
+    if prev_face is not None and candidate is not None:
+        dist_ratio = abs(candidate["center_x"] - prev_face["center_x"]) / max(1.0, float(src_w))
+        # If switching to a different person (horizontal separation > 15% of frame width)
+        if dist_ratio > 0.15:
+            if (current_time - last_switch_time) < hysteresis_sec:
+                # Hold onto the face closest to prev_face unless hysteresis window has elapsed
+                nearest_prev = min(
+                    sorted_by_x,
+                    key=lambda f: abs(f["center_x"] - prev_face["center_x"]),
+                )
+                return nearest_prev, last_switch_time
+            return candidate, current_time
+
+    return candidate, last_switch_time
+
+
+def classify_layout(
+    faces: list[dict[str, Any]],
+    src_w: int = 1920,
+    src_h: int = 1080,
+    ocr_text_density: float = 0.0,
+) -> str:
+    """
+    Automatic layout classifier (suggestions.md §3 Reframing):
+      - Slides or text-dense frames (ocr_text_density >= 0.35) -> 'screenshare'
+      - Corner webcam face + busy content -> 'gameplay'
+      - 2 prominent faces separated horizontally in same frame -> 'split_screen'
+      - 1 usable face -> 'vertical' (Fill)
+      - 0 usable faces -> 'blur_bg' (Fit with blurred background)
+    """
+    if ocr_text_density >= 0.35:
+        return "screenshare"
+    if not faces:
+        return "blur_bg"
+    frame_area = max(1, src_w * src_h)
+    valid = [f for f in faces if (f["w"] * f["h"]) / frame_area >= 0.004]
+    if not valid:
+        return "blur_bg"
+    if len(valid) == 1:
+        f0 = valid[0]
+        area_ratio = (f0["w"] * f0["h"]) / frame_area
+        in_corner = (f0["center_x"] < 0.25 * src_w or f0["center_x"] > 0.75 * src_w) and (
+            f0["center_y"] < 0.30 * src_h or f0["center_y"] > 0.70 * src_h
+        )
+        if in_corner and area_ratio < 0.04:
+            return "gameplay"
+        return "vertical"
+    # Two or more faces: check horizontal separation
+    sorted_f = sorted(valid, key=lambda f: f["w"] * f["h"], reverse=True)[:2]
+    sep = abs(sorted_f[0]["center_x"] - sorted_f[1]["center_x"]) / max(1.0, float(src_w))
+    if sep >= 0.22:
+        return "split_screen"
+    return "vertical"
+
+
+def compute_face_in_frame_ratio(
+    face_centers_per_frame: list[Optional[float]],
+    keyframes: list[CropKeyframe],
+    crop_w: int,
+) -> float:
+    """
+    Measure true geometric face-in-frame rate: the fraction of detected-face samples
+    where the active speaker's face center lies inside the smoothed crop window [kf.x, kf.x + crop_w].
+    """
+    if not face_centers_per_frame or not keyframes:
+        return 1.0
+    detected_samples = 0
+    in_frame_samples = 0
+    for idx, face_cx in enumerate(face_centers_per_frame):
+        if face_cx is None:
+            continue
+        detected_samples += 1
+        kf = keyframes[min(idx, len(keyframes) - 1)]
+        if kf.x <= face_cx <= (kf.x + crop_w):
+            in_frame_samples += 1
+    if detected_samples == 0:
+        return 1.0
+    return round(in_frame_samples / float(detected_samples), 4)
+
 
 
 # ── Motion Smoothing & Pan Limiting ───────────────────────────────────────────
@@ -570,6 +684,48 @@ def generate_crop_filter_expression(
     return f"crop={crop_w}:{crop_h}:x='{full_expr}':y=0"
 
 
+def generate_sendcmd_crop_script(
+    keyframes: list[CropKeyframe],
+    out_path: Path,
+    crop_w: int,
+    crop_h: int,
+    src_w: int,
+) -> tuple[Path, str]:
+    """
+    Generate an FFmpeg `sendcmd` command script updating crop@reframe x/y at runtime.
+    Removes the 22-segment nested `if(lt(t,...))` expression parser limit in FFmpeg.
+    Returns (cmd_file_path, filtergraph_string).
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    max_x = max(0, src_w - crop_w)
+    lines: list[str] = []
+    if not keyframes:
+        cx = max(0, (src_w - crop_w) // 2)
+        lines.append(f"0.000 [enter] crop@reframe x {cx}, crop@reframe y 0;")
+    else:
+        for kf in keyframes:
+            clamped_x = max(0, min(max_x, int(kf.x)))
+            clamped_y = max(0, int(kf.y))
+            lines.append(
+                f"{max(0.0, kf.time):.3f} [enter] crop@reframe x {clamped_x}, crop@reframe y {clamped_y};"
+            )
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    init_x = max(0, min(max_x, int(keyframes[0].x))) if keyframes else max(0, (src_w - crop_w) // 2)
+    init_y = max(0, int(keyframes[0].y)) if keyframes else 0
+    escaped_cmd = str(out_path).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    filter_str = f"sendcmd=f='{escaped_cmd}',crop@reframe={crop_w}:{crop_h}:{init_x}:{init_y}"
+    return out_path, filter_str
+
+
+def _escape_ass_path(ass_path: Path | str) -> str:
+    raw = str(ass_path)
+    return (
+        raw.replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+    )
+
+
 def build_blur_bg_filter_complex(
     out_w: int = OUTPUT_WIDTH,
     out_h: int = OUTPUT_HEIGHT,
@@ -581,7 +737,7 @@ def build_blur_bg_filter_complex(
     Background: blurred and slightly darkened full bleed.
     Foreground: centered, letterboxed original video with sharp details.
     """
-    ass_filter = f",ass='{str(ass_path)}'" if ass_path else ""
+    ass_filter = f",ass='{_escape_ass_path(ass_path)}'" if ass_path else ""
     return (
         f"[0:v]split=2[bg_in][fg_in];"
         f"[bg_in]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
@@ -596,25 +752,30 @@ def build_split_screen_filter_complex(
     out_w: int = OUTPUT_WIDTH,
     out_h: int = OUTPUT_HEIGHT,
     ass_path: Optional[Path | str] = None,
+    top_speaker_x_ratio: float = 0.25,
+    bottom_speaker_x_ratio: float = 0.75,
 ) -> str:
     """
-    Build the FFmpeg -filter_complex graph for 50/50 vertical split-screen layout.
+    Build the FFmpeg -filter_complex graph for 50/50 vertical two-speaker split-screen layout.
     Canvas: 1080×1920 (9:16).
-    Top pane: 1080×960 scaled & cropped view of speaker.
-    Bottom pane: 1080×960 scaled & cropped content.
+    Top pane: 1080×960 focused on Speaker A (left/top_speaker_x_ratio).
+    Bottom pane: 1080×960 focused on Speaker B (right/bottom_speaker_x_ratio).
     Optionally burned with word-highlight captions.
     """
     half_h = out_h // 2
-    ass_filter = f",ass='{str(ass_path)}'" if ass_path else ""
+    top_r = max(0.0, min(1.0, float(top_speaker_x_ratio)))
+    bot_r = max(0.0, min(1.0, float(bottom_speaker_x_ratio)))
+    ass_filter = f",ass='{_escape_ass_path(ass_path)}'" if ass_path else ""
     return (
         f"[0:v]split=2[top_in][bot_in];"
         f"[top_in]scale={out_w}:{half_h}:force_original_aspect_ratio=increase,"
-        f"crop={out_w}:{half_h}[top];"
+        f"crop={out_w}:{half_h}:x='clip((in_w-{out_w})*{top_r:.2f},0,in_w-{out_w})':y='(in_h-{half_h})/2'[top];"
         f"[bot_in]scale={out_w}:{half_h}:force_original_aspect_ratio=increase,"
-        f"crop={out_w}:{half_h}[bot];"
+        f"crop={out_w}:{half_h}:x='clip((in_w-{out_w})*{bot_r:.2f},0,in_w-{out_w})':y='(in_h-{half_h})/2'[bot];"
         f"[top][bot]vstack=inputs=2[stacked]"
         + (f";[stacked]{ass_filter.lstrip(',')}[out]" if ass_path else ";[stacked]copy[out]")
     )
+
 
 
 # ── Core Pipeline Function ────────────────────────────────────────────────────
@@ -682,7 +843,10 @@ def compute_reframe(
         )
 
     cap = cv2.VideoCapture(str(source_video))
-    prev_face_cx = None
+    prev_face: Optional[dict[str, Any]] = None
+    prev_face_cx: Optional[float] = None
+    last_switch_time = -10.0
+    face_centers_per_frame: list[Optional[float]] = []
 
     try:
         for t_rel in sample_times:
@@ -693,16 +857,27 @@ def compute_reframe(
 
             if not ret or frame is None:
                 target_x = center_x
+                face_centers_per_frame.append(None)
             else:
                 faces = engine.detect(frame)
-                primary = select_primary_face(faces, prev_center_x=prev_face_cx, src_w=src_w)
+                primary, last_switch_time = select_active_speaker_face(
+                    faces=faces,
+                    current_time=t_rel,
+                    prev_face=prev_face,
+                    last_switch_time=last_switch_time,
+                    hysteresis_sec=1.5,
+                    src_w=src_w,
+                )
                 if primary:
                     faces_detected_count += 1
+                    prev_face = primary
                     prev_face_cx = primary["center_x"]
+                    face_centers_per_frame.append(primary["center_x"])
                     # Center the crop window around primary face
                     ideal_x = int(round(primary["center_x"] - (crop_w / 2.0)))
                     target_x = max(0, min(src_w - crop_w, ideal_x))
                 else:
+                    face_centers_per_frame.append(None)
                     # Fallback to last known position or center
                     target_x = int(round(prev_face_cx - (crop_w / 2.0))) if prev_face_cx else center_x
 
@@ -717,9 +892,6 @@ def compute_reframe(
         if not detector:
             engine.close()
 
-    total_samples = len(sample_times) or 1
-    face_ratio = faces_detected_count / total_samples
-
     # Smooth the trajectory
     smoothed_keyframes = smooth_crop_trajectory(
         raw_positions=raw_positions,
@@ -727,6 +899,13 @@ def compute_reframe(
         src_w=src_w,
         crop_w=crop_w,
     )
+
+    face_ratio = compute_face_in_frame_ratio(
+        face_centers_per_frame=face_centers_per_frame,
+        keyframes=smoothed_keyframes,
+        crop_w=crop_w,
+    )
+
 
     crop_expr = generate_crop_filter_expression(smoothed_keyframes, crop_w, crop_h, src_w)
     logger.info(

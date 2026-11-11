@@ -175,7 +175,11 @@ class RenderSettings(Base):
     layout: Mapped[Layout] = mapped_column(Enum(Layout), nullable=False, default=Layout.vertical)
     caption_style: Mapped[dict | None] = mapped_column(JSONB)    # {font, size, color, highlight_color, position}
     crop_keyframes: Mapped[dict | None] = mapped_column(JSONB)   # face-tracking crop path
+    excluded_word_indices: Mapped[list | None] = mapped_column(JSONB)  # persisted word deletions
+    word_overrides: Mapped[dict | None] = mapped_column(JSONB)         # persisted word text edits
+    edl: Mapped[dict | None] = mapped_column(JSONB)                    # canonical EDL snapshot
     brand_kit_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("brand_kits.id", ondelete="SET NULL"))
+
 
     # Relationships
     clip: Mapped[Clip] = relationship(back_populates="render_settings")
@@ -224,3 +228,108 @@ class BrandKit(Base):
     fonts: Mapped[dict | None] = mapped_column(JSONB)    # {primary, secondary}
     colors: Mapped[dict | None] = mapped_column(JSONB)   # {primary, secondary, accent}
     default_caption_style: Mapped[dict | None] = mapped_column(JSONB)
+
+
+
+
+# ── Platform, Stage Runs, Artifacts, EDL Versions & Credits (v2.1) ────────────
+
+class Organization(Base):
+    __tablename__ = "organizations"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    plan_tier: Mapped[str] = mapped_column(String(32), nullable=False, default="FREE")
+    credits_remaining: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=_now)
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    org_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    role: Mapped[str] = mapped_column(String(32), nullable=False, default="OWNER")
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=_now)
+
+
+class StageRun(Base):
+    """One row per (project_id, stage, attempt) recording timing, status, model version, and artifacts."""
+    __tablename__ = "stage_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    stage: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    status: Mapped[JobStatus] = mapped_column(Enum(JobStatus), nullable=False, default=JobStatus.queued)
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    progress: Mapped[int] = mapped_column(Integer, default=0)
+    model_version: Mapped[str | None] = mapped_column(String(64))
+    prompt_version: Mapped[str | None] = mapped_column(String(64))
+    output_artifact_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    error: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), default=_now)
+    finished_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+
+
+class Artifact(Base):
+    """Versioned stage output artifact stored in object storage or JSONB."""
+    __tablename__ = "artifacts"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    clip_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("clips.id", ondelete="CASCADE"), index=True)
+    artifact_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    storage_key: Mapped[str | None] = mapped_column(Text)
+    data: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=_now)
+
+
+class ClipVersion(Base):
+    """Immutable EDL snapshot for undo/redo and clip variant history."""
+    __tablename__ = "clip_versions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    clip_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("clips.id", ondelete="CASCADE"), index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    edl: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=_now)
+
+
+class CreditLedger(Base):
+    """Append-only credit ledger (grants, spends, refunds, expiries)."""
+    __tablename__ = "credit_ledger"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    org_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("organizations.id", ondelete="SET NULL"), index=True)
+    project_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("projects.id", ondelete="SET NULL"), index=True)
+    delta: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str] = mapped_column(String(128), nullable=False)
+    balance_after: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=_now)
+
+
+class FeedbackEvent(Base):
+    """User interaction telemetry (kept, trimmed, exported, published, rejected) for score calibration."""
+    __tablename__ = "feedback_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    clip_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("clips.id", ondelete="CASCADE"), index=True)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=_now)
+
+
+class ApiKey(Base):
+    __tablename__ = "api_keys"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    org_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    key_prefix: Mapped[str] = mapped_column(String(16), nullable=False)
+    key_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=_now)
+

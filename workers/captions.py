@@ -36,10 +36,13 @@ class CaptionStyle:
     shadow_depth: float = 1.0
     margin_v: int = 80                       # px from bottom
     alignment: int = 2                       # 2=center bottom, 8=center top
+    auto_emoji: bool = False
+    pop_animation: bool = False
 
     # Output resolution (must match render target)
     play_res_x: int = 1080
     play_res_y: int = 1920
+
 
 
 DEFAULT_STYLE = CaptionStyle()
@@ -116,8 +119,65 @@ def get_caption_style(style_input: dict | str | None) -> CaptionStyle:
             shadow_depth=float(style_input.get("shadow_depth", base.shadow_depth)),
             margin_v=int(style_input.get("margin_v", base.margin_v)),
             alignment=int(style_input.get("alignment", base.alignment)),
+            auto_emoji=bool(style_input.get("auto_emoji", base.auto_emoji)),
+            pop_animation=bool(style_input.get("pop_animation", base.pop_animation)),
         )
     return DEFAULT_STYLE
+
+
+# ── Auto-Emoji & Phrase Cadence Grouping ──────────────────────────────────────
+
+_KEYWORD_EMOJI_MAP: dict[str, str] = {
+    "money": "💰", "dollars": "💵", "revenue": "💰", "profit": "📈", "pricing": "💲",
+    "growth": "📈", "scale": "🚀", "scaling": "🚀", "launch": "🚀", "launching": "🚀",
+    "shipped": "🚢", "viral": "🔥", "fire": "🔥", "insane": "🔥", "hot": "🔥",
+    "mistake": "⚠️", "mistakes": "⚠️", "bug": "🐛", "bugs": "🐛", "fail": "❌",
+    "failure": "❌", "warning": "⚠️", "idea": "💡", "secret": "🤫", "brain": "🧠",
+    "ai": "🤖", "agent": "🤖", "agents": "🤖", "time": "⏱️", "fast": "⚡",
+    "win": "🏆", "winner": "🏆", "success": "✅", "perfect": "✨", "love": "❤️",
+}
+
+
+def inject_auto_emojis(text: str) -> str:
+    """Append contextual emoji to a word or phrase when a keyword matches."""
+    tokens = re.findall(r"\b[a-zA-Z0-9]+\b", (text or "").lower())
+    for tok in tokens:
+        if tok in _KEYWORD_EMOJI_MAP:
+            emoji = _KEYWORD_EMOJI_MAP[tok]
+            if emoji not in text:
+                return f"{text} {emoji}"
+    return text
+
+
+def group_words_into_phrases(
+    words: list[Word],
+    max_words_per_line: int = 6,
+    pause_threshold: float = 0.45,
+) -> list[list[Word]]:
+    """
+    Group words into readable caption phrases (1..max_words_per_line words)
+    breaking naturally at sentence punctuation (. ! ? ,) or speech pauses >= pause_threshold.
+    """
+    if not words:
+        return []
+    phrases: list[list[Word]] = []
+    curr: list[Word] = []
+    for i, w in enumerate(words):
+        curr.append(w)
+        is_max = len(curr) >= max_words_per_line
+        has_punct = bool(re.search(r"[.!?][\"']?$", w.text.strip())) and len(curr) >= 2
+        has_pause = (
+            (i + 1 < len(words))
+            and ((words[i + 1].start - w.end) >= pause_threshold)
+            and len(curr) >= 2
+        )
+        if is_max or has_punct or has_pause:
+            phrases.append(curr)
+            curr = []
+    if curr:
+        phrases.append(curr)
+    return phrases
+
 
 
 # ── ASS helpers ───────────────────────────────────────────────────────────────
@@ -161,12 +221,16 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
 
-def _words_to_karaoke_line(words: list[Word], clip_start: float) -> str:
+def _words_to_karaoke_line(
+    words: list[Word],
+    clip_start: float,
+    auto_emoji: bool = False,
+    pop_animation: bool = False,
+) -> str:
     r"""
     Convert a list of words to an ASS karaoke-style dialogue line.
-    Uses {\k<duration>} tags where duration is in centiseconds.
-
-    Each word is wrapped so it highlights (changes color) at its timestamp.
+    Uses {\kf<duration>} tags where duration is in centiseconds.
+    Optionally adds pop-scale emphasis and contextual auto-emojis.
     """
     parts = []
     for i, word in enumerate(words):
@@ -178,9 +242,12 @@ def _words_to_karaoke_line(words: list[Word], clip_start: float) -> str:
 
         duration_cs = max(1, int(round((next_start - word.start) * 100)))
         text = word.text.replace("{", "").replace("}", "").strip()
+        if auto_emoji:
+            text = inject_auto_emojis(text)
 
+        pop_prefix = r"{\fscx112\fscy112\t(0,120,\fscx100\fscy100)}" if pop_animation else ""
         # {\kf<cs>} = karaoke fill — word highlights progressively
-        parts.append(f"{{\\kf{duration_cs}}}{text}")
+        parts.append(f"{pop_prefix}{{\\kf{duration_cs}}}{text}")
 
     return " ".join(parts)
 
@@ -193,37 +260,32 @@ def generate_captions(
     work_dir: Path,
     style: Optional[CaptionStyle] = None,
     max_words_per_line: int = 6,
+    excluded_word_indices: Optional[list[int | str] | set[int | str]] = None,
+    word_overrides: Optional[dict[str | int, str]] = None,
 ) -> Path:
     """
     Generate an ASS caption file for a single clip.
-
-    Args:
-        clip:               Clip definition (start/end times)
-        transcript:         Full transcript (we extract words within clip window)
-        work_dir:           Project scratch dir
-        style:              Caption visual style (uses DEFAULT_STYLE if None)
-        max_words_per_line: Word wrap threshold for readability
-
-    Returns:
-        Path to the generated .ass file
+    Respects excluded_word_indices and word_overrides from the Studio / EDL.
     """
     style = style or DEFAULT_STYLE
     captions_dir = work_dir / "captions"
     captions_dir.mkdir(parents=True, exist_ok=True)
 
+    has_edits = bool(excluded_word_indices) or bool(word_overrides)
     clip_id = f"clip_{int(clip.start * 10):06d}_{int(clip.end * 10):06d}"
     out_path = captions_dir / f"{clip_id}.ass"
 
-    if out_path.exists():
+    if out_path.exists() and not has_edits:
         logger.debug("[Stage 6a] Cached captions: {}", out_path.name)
         return out_path
 
-    # ── Gather words in clip window ───────────────────────────────────────────
-    clip_words: list[Word] = []
-    for seg in transcript.segments:
-        for word in seg.words:
-            if clip.start - 0.5 <= word.start <= clip.end + 0.5:
-                clip_words.append(word)
+    # ── Gather words in clip window (filtering excluded words & overrides) ────
+    clip_words = get_clip_words(
+        clip,
+        transcript,
+        excluded_word_indices=excluded_word_indices,
+        word_overrides=word_overrides,
+    )
 
     if not clip_words:
         logger.warning(
@@ -233,16 +295,8 @@ def generate_captions(
         out_path.write_text(_build_ass_header(style))
         return out_path
 
-    # ── Group words into lines ────────────────────────────────────────────────
-    lines: list[list[Word]] = []
-    current_line: list[Word] = []
-    for word in clip_words:
-        current_line.append(word)
-        if len(current_line) >= max_words_per_line:
-            lines.append(current_line)
-            current_line = []
-    if current_line:
-        lines.append(current_line)
+    # ── Group words into cadence-aware lines ──────────────────────────────────
+    lines = group_words_into_phrases(clip_words, max_words_per_line=max_words_per_line)
 
     # ── Build ASS dialogue events ─────────────────────────────────────────────
     events: list[str] = []
@@ -259,7 +313,12 @@ def generate_captions(
 
         ass_start = _seconds_to_ass_time(line_start)
         ass_end = _seconds_to_ass_time(line_end)
-        karaoke_text = _words_to_karaoke_line(line_words, clip.start)
+        karaoke_text = _words_to_karaoke_line(
+            line_words,
+            clip.start,
+            auto_emoji=style.auto_emoji,
+            pop_animation=style.pop_animation,
+        )
 
         events.append(
             f"Dialogue: 0,{ass_start},{ass_end},Default,,0,0,0,,{karaoke_text}"
@@ -274,6 +333,7 @@ def generate_captions(
         len(lines), len(clip_words), out_path.name,
     )
     return out_path
+
 
 
 # ── SRT & WebVTT Export ───────────────────────────────────────────────────────
@@ -300,14 +360,45 @@ def _seconds_to_vtt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
 
-def get_clip_words(clip: Clip, transcript: Transcript) -> list[Word]:
-    """Gather all words that occur within the clip's time boundary."""
-    words: list[Word] = []
+def get_clip_words(
+    clip: Clip,
+    transcript: Transcript,
+    excluded_word_indices: Optional[list[int | str] | set[int | str]] = None,
+    word_overrides: Optional[dict[str | int, str]] = None,
+) -> list[Word]:
+    """
+    Gather all words that occur within the clip's time boundary,
+    filtering out any excluded word indices/IDs and applying text overrides.
+    """
+    raw_words: list[Word] = []
     for seg in transcript.segments:
         for word in seg.words:
             if clip.start - 0.5 <= word.start <= clip.end + 0.5:
-                words.append(word)
-    return words
+                raw_words.append(word)
+
+    if not excluded_word_indices and not word_overrides:
+        return raw_words
+
+    excl_set = set(excluded_word_indices or [])
+    excl_str_set = {str(x) for x in excl_set}
+    overrides = {str(k): v for k, v in (word_overrides or {}).items()}
+
+    filtered: list[Word] = []
+    for idx, w in enumerate(raw_words):
+        if idx in excl_set or str(idx) in excl_str_set or (w.id and w.id in excl_str_set):
+            continue
+        new_text = overrides.get(str(idx)) or (overrides.get(w.id) if w.id else None) or w.text
+        filtered.append(
+            Word(
+                text=new_text,
+                start=w.start,
+                end=w.end,
+                probability=w.probability,
+                id=w.id,
+                speaker=w.speaker,
+            )
+        )
+    return filtered
 
 
 def generate_srt(
@@ -315,11 +406,19 @@ def generate_srt(
     transcript: Transcript,
     relative: bool = True,
     max_words_per_line: int = 7,
+    excluded_word_indices: Optional[list[int | str] | set[int | str]] = None,
+    word_overrides: Optional[dict[str | int, str]] = None,
 ) -> str:
     """Generate SRT subtitle text for a clip."""
-    words = get_clip_words(clip, transcript)
+    words = get_clip_words(
+        clip,
+        transcript,
+        excluded_word_indices=excluded_word_indices,
+        word_overrides=word_overrides,
+    )
     if not words:
         return ""
+
 
     lines: list[list[Word]] = []
     curr: list[Word] = []
@@ -350,12 +449,20 @@ def generate_vtt(
     transcript: Transcript,
     relative: bool = True,
     max_words_per_line: int = 7,
+    excluded_word_indices: Optional[list[int | str] | set[int | str]] = None,
+    word_overrides: Optional[dict[str | int, str]] = None,
 ) -> str:
     """Generate WebVTT subtitle text for a clip."""
-    words = get_clip_words(clip, transcript)
+    words = get_clip_words(
+        clip,
+        transcript,
+        excluded_word_indices=excluded_word_indices,
+        word_overrides=word_overrides,
+    )
     header = "WEBVTT\n\n"
     if not words:
         return header
+
 
     lines: list[list[Word]] = []
     curr: list[Word] = []

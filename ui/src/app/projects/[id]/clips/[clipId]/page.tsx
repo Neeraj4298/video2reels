@@ -113,15 +113,39 @@ function ScoreBar({ label, value }: { label: string; value: number }) {
 }
 
 // ─── Waveform Visualization ───────────────────────────────────────────────────
-function WaveformBars({ count = 48, seed = 42 }: { count?: number; seed?: number }) {
+function WaveformBars({
+  count = 48,
+  seed = 42,
+  words = [],
+  clipStart = 0,
+  clipEnd = 30,
+}: {
+  count?: number;
+  seed?: number;
+  words?: TranscriptWord[];
+  clipStart?: number;
+  clipEnd?: number;
+}) {
   const bars = useMemo(() => {
+    const dur = Math.max(0.5, clipEnd - clipStart);
+    if (words && words.length > 0) {
+      return Array.from({ length: count }, (_, i) => {
+        const binStart = clipStart + (i / count) * dur;
+        const binEnd = clipStart + ((i + 1) / count) * dur;
+        const active = words.filter((w) => w.e >= binStart && w.s <= binEnd);
+        if (active.length === 0) return 14;
+        const avgProb = active.reduce((acc, w) => acc + (w.p || 0.9), 0) / active.length;
+        const charDensity = Math.min(1, active.reduce((acc, w) => acc + w.w.length, 0) / 10);
+        return Math.max(22, Math.min(96, Math.round((0.55 * avgProb + 0.45 * charDensity) * 95)));
+      });
+    }
     return Array.from({ length: count }, (_, i) => {
-      // Deterministic synthetic waveform heights
       const sinVal = Math.sin((i + seed) * 0.45) * 0.35 + Math.cos((i + seed) * 0.2) * 0.25;
       const height = Math.max(15, Math.min(95, Math.round((sinVal + 0.6) * 70)));
       return height;
     });
-  }, [count, seed]);
+  }, [count, seed, words, clipStart, clipEnd]);
+
 
   return (
     <div
@@ -218,7 +242,11 @@ export default function ClipDetailPage() {
     if (transcriptData?.text) {
       setEditedTranscriptText(transcriptData.text);
     }
-  }, [transcriptData?.text]);
+    if (transcriptData?.excluded_word_indices) {
+      setExcludedWordIndices(new Set(transcriptData.excluded_word_indices));
+    }
+  }, [transcriptData?.text, transcriptData?.excluded_word_indices]);
+
 
   async function fetchVideoUrl() {
     if (!clipId || loadingUrl) return;
@@ -291,9 +319,11 @@ export default function ClipDetailPage() {
         start: editStart,
         end: editEnd,
         caption_style: captionStyle as Record<string, unknown>,
+        excluded_word_indices: Array.from(excludedWordIndices),
       });
-      toast("Changes saved!", "success");
+      toast("Changes and EDL word edits saved!", "success");
       mutate();
+      mutateTranscript();
     } catch {
       toast("Failed to save changes", "error");
     } finally {
@@ -309,6 +339,7 @@ export default function ClipDetailPage() {
         layout,
         caption_style: captionStyle as Record<string, unknown>,
         brand_kit_id: selectedBrandKitId || undefined,
+        excluded_word_indices: Array.from(excludedWordIndices),
       });
       toast("Render queued! Celery worker processing in background...", "info");
       mutate();
@@ -318,6 +349,7 @@ export default function ClipDetailPage() {
       setRendering(false);
     }
   }
+
 
   function handleSelectPreset(key: string) {
     setSelectedPreset(key);
@@ -420,6 +452,15 @@ export default function ClipDetailPage() {
             >
               📝 Export VTT
             </a>
+            <a
+              href={api.clips.exportXmlUrl(clip.id)}
+              download
+              className="btn btn-secondary btn-sm"
+              title="Export Premiere Pro / DaVinci Resolve XML Bundle"
+            >
+              🎬 Export XML
+            </a>
+
             {clip.status === "done" && (
               <button
                 className="btn btn-primary btn-sm"
@@ -607,8 +648,15 @@ export default function ClipDetailPage() {
                       margin: "var(--space-4) 0",
                     }}
                   >
-                    {/* Background synthetic waveform */}
-                    <WaveformBars count={64} seed={Math.round(clip.start * 10)} />
+                    {/* Real transcript-driven waveform */}
+                    <WaveformBars
+                      count={64}
+                      seed={Math.round(clip.start * 10)}
+                      words={words}
+                      clipStart={clip.start}
+                      clipEnd={clip.end}
+                    />
+
 
                     {/* Active Trim Range Box */}
                     <div

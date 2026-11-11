@@ -80,7 +80,35 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v2.1.0] — Phase 6: OpusClip-Class Architecture, EDL Compiler, Signals Layer, Eval Harness & MCP
+- **Security & Fail-Loudly Hardening (`api/storage.py`, `workers/ingest.py`, `workers/transcribe.py`, `workers/render.py`)**:
+  - Added `sanitize_storage_key` to prevent directory traversal (`..`) and gated `/api/clips/storage/{bucket}/{key:path}` behind `allow_local_storage_routes`.
+  - Added `validate_source_url` SSRF protection (blocking non-HTTP schemes, localhost, RFC1918 private IPs, and cloud metadata endpoints), Constant Frame Rate (CFR) normalization (`needs_cfr_normalization`, `normalize_to_cfr`), and 720p proxy generation (`generate_proxy_video`).
+  - Removed silent fabricated `_fallback_transcript_from_wav` so ASR failures fail loudly; flagged heuristic clip fallbacks with `low_confidence=True`.
+  - Added `escape_ffmpeg_filter_path` for safe `ass='...'` and `sendcmd` filter path embedding.
+- **Data Model, Stage Runs, Artifacts & Credits (`api/models/__init__.py`, `infra/migrations/versions/002_opusclip_platform_schema.py`, `workers/tasks.py`)**:
+  - Added `Organization`, `User`, `StageRun`, `Artifact`, `ClipVersion`, `CreditLedger`, `FeedbackEvent`, and `ApiKey` ORM models + Alembic migration `002_opusclip_platform_schema`.
+  - Updated `_update_job_status` to maintain one `Job` row per `(project_id, stage)` instead of overwriting a single row, and record `StageRun` telemetry.
+  - Updated `stage_transcribe` and `stage_select_clips` to persist and load transcript `Artifact` records by ID.
+- **Core AI Accuracy — Word IDs, 10 Hz Signals Layer, Word-ID Highlight Judge & ASD Reframing (`workers/transcribe.py`, `workers/signals.py`, `workers/select_clips.py`, `workers/reframe.py`)**:
+  - Assigned deterministic stable word IDs (`w_000001`, ...) across transcripts and added `.srt` override parsing (`transcript_from_srt`) and `custom_vocabulary` prompt hints.
+  - Added 10 Hz Multimodal Signals Layer (`workers/signals.py`) computing RMS energy, pitch, speech rate, audio events, scene cuts, and silence intervals.
+  - Upgraded `select_clips` to resolve `[start_word_id, end_word_id]`, refine dependent-clause openings (`starts_with_dependent_clause`, `refine_clip_boundaries`), and calibrate virality blend weights from user feedback (`calibrate_blend_weights`).
+  - Upgraded `reframe.py` with active speaker selection + 1.5s hysteresis (`select_active_speaker_face`), automatic layout classification (`classify_layout`), distinct two-speaker split-screen cropping, FFmpeg `sendcmd` script generation (`generate_sendcmd_crop_script`), and true geometric `compute_face_in_frame_ratio`.
+- **Canonical EDL Compiler, Caption Overrides & FCP7 XML Export (`workers/edl.py`, `workers/captions.py`, `workers/xml_export.py`, `api/routers/clips.py`, `ui/`)**:
+  - Added `EDL` schema and compiler (`compile_edl_from_clip`, `compute_cuts_from_excluded_words`, `build_edl_audio_filter` with 15ms audio crossfades + EBU R128 loudness normalization).
+  - Upgraded `captions.py` with cadence-based phrase grouping, contextual auto-emoji injection (`inject_auto_emojis`), pop-scale animations, and `excluded_word_indices` / `word_overrides` filtering across ASS, SRT, and VTT.
+  - Added Premiere Pro / DaVinci Resolve `<xmeml version="4">` interchange XML + SRT ZIP export (`GET /api/clips/{id}/export-xml`) and EDL CRUD (`GET/PATCH /api/clips/{id}/edl`).
+  - Wired the Next.js Clip Studio (`ui/src/app/projects/[id]/clips/[clipId]/page.tsx`) to persist `excluded_word_indices` on Save & Re-render, display real transcript-driven waveform bars, and export XML bundles.
+- **Evaluation Harness & MCP Server (`workers/eval_harness.py`, `api/routers/platform.py`)**:
+  - Added quantitative Evaluation Harness (`WER`, caption onset error, `DER`, highlight IoU, mid-sentence boundary rate, face-in-frame rate, camera jitter, clip acceptance rate) and golden benchmark suite (`GET /api/eval/report`).
+  - Added OpusClip credit estimator & append-only ledger (`/api/credits/estimate`, `/api/credits/balance`, `/api/credits/charge`), feedback & calibration (`POST /api/clips/{id}/feedback`), and MCP server endpoints (`/api/mcp/tools`, `/api/mcp/call`).
+- **Test Suite Expansion**: Expanded from 143 to 158 passing tests (100% pass rate).
+
+---
+
 ## Roadmap
+
 
 | Version | Phase | Description | Target |
 |---|---|---|---|

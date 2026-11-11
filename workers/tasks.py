@@ -136,17 +136,31 @@ def _update_job_status(
     progress: int,
     error: str | None = None,
     attempts: int = 0,
+    model_version: str | None = None,
+    prompt_version: str | None = None,
 ):
-    """Persist job state directly in PostgreSQL."""
-    from api.models import Job
+    """
+    Persist per-stage Job and StageRun state in PostgreSQL.
+    Stops overwriting a single Job row per project; maintains one Job row per (project_id, stage)
+    and records a StageRun row per (project_id, stage, attempt).
+    """
+    from api.models import Job, StageRun
     try:
+        proj_uuid = uuid.UUID(project_id)
         with _get_session() as db:
             job = db.execute(
-                select(Job).where(Job.project_id == uuid.UUID(project_id))
+                select(Job).where(Job.project_id == proj_uuid, Job.stage == stage)
             ).scalars().first()
             if not job:
-                job = Job(project_id=uuid.UUID(project_id))
-                db.add(job)
+                # Reuse an initial placeholder job if it has no stage or matching stage
+                placeholder = db.execute(
+                    select(Job).where(Job.project_id == proj_uuid, Job.stage.is_(None))
+                ).scalars().first()
+                if placeholder:
+                    job = placeholder
+                else:
+                    job = Job(project_id=proj_uuid, stage=stage)
+                    db.add(job)
             job.stage = stage
             job.status = status_val
             job.progress = progress
@@ -161,9 +175,46 @@ def _update_job_status(
                 job.started_at = now
             elif status_val.value in ("done", "failed"):
                 job.finished_at = now
+
+            # Also record/update StageRun row
+            eff_attempt = max(1, attempts or job.attempts or 1)
+            sr = db.execute(
+                select(StageRun).where(
+                    StageRun.project_id == proj_uuid,
+                    StageRun.stage == stage,
+                    StageRun.attempt == eff_attempt,
+                )
+            ).scalars().first()
+            if not sr:
+                sr = StageRun(
+                    project_id=proj_uuid,
+                    stage=stage,
+                    attempt=eff_attempt,
+                    status=status_val,
+                    progress=progress,
+                    model_version=model_version,
+                    prompt_version=prompt_version,
+                    started_at=now,
+                )
+                db.add(sr)
+            else:
+                sr.status = status_val
+                sr.progress = progress
+                if model_version:
+                    sr.model_version = model_version
+                if prompt_version:
+                    sr.prompt_version = prompt_version
+                if error is not None:
+                    sr.error = error
+                elif status_val.value in ("running", "done"):
+                    sr.error = None
+                if status_val.value in ("done", "failed"):
+                    sr.finished_at = now
+
             db.commit()
     except Exception as exc:
         logger.warning("Could not update job status in DB: %s", exc)
+
 
 
 def _update_project_status(project_id: str, status_val: Any):
@@ -645,20 +696,41 @@ def stage_transcribe(self, prev: dict) -> dict:
 
         transcript_data = transcript.to_dict()
 
-    # Persist transcript to DB
+    # Persist transcript to DB & Artifact table (avoid passing huge transcripts only via Celery)
+    transcript_id_str = None
+    artifact_id_str = None
     with _get_session() as db:
+        from api.models import Artifact
         video = db.execute(
             select(Video).where(Video.project_id == uuid.UUID(project_id))
         ).scalars().first()
         if video:
-            tr = Transcript(video_id=video.id, data=transcript_data, model="faster-whisper-base")
+            tr = Transcript(video_id=video.id, data=transcript_data, model="faster-whisper")
             db.add(tr)
             video.language = transcript.language
-            db.commit()
+            db.flush()
+            transcript_id_str = str(tr.id)
+        art = Artifact(
+            project_id=uuid.UUID(project_id),
+            artifact_type="transcript",
+            version=1,
+            storage_key=f"{project_id}/transcripts/transcript.json",
+            data=transcript_data,
+        )
+        db.add(art)
+        db.flush()
+        artifact_id_str = str(art.id)
+        db.commit()
 
     _emit(project_id, "transcribing", 55, f"Transcribed ✓ — {len(transcript.all_words)} words")
-    _update_job_status(project_id, "transcribe", JobStatus.running, 55)
-    return {**prev, "transcript": transcript_data}
+    _update_job_status(project_id, "transcribe", JobStatus.done, 55, model_version="faster-whisper")
+    return {
+        **prev,
+        "transcript_id": transcript_id_str,
+        "transcript_artifact_id": artifact_id_str,
+        "transcript": transcript_data,
+    }
+
 
 
 # ── Stage 4: Clip Selection ────────────────────────────────────────────────────
@@ -719,9 +791,34 @@ def stage_select_clips(self, prev: dict) -> dict:
     with tempfile.TemporaryDirectory() as tmpdir:
         work_dir = Path(tmpdir)
         try:
-            transcript = Transcript.from_dict(prev["transcript"])
+            transcript_dict = prev.get("transcript")
+            if not transcript_dict:
+                from api.models import Artifact, Transcript as TranscriptModel, Video
+                with _get_session() as db:
+                    if prev.get("transcript_id"):
+                        tr_row = db.get(TranscriptModel, uuid.UUID(str(prev["transcript_id"])))
+                        if tr_row and tr_row.data:
+                            transcript_dict = tr_row.data
+                    if not transcript_dict and prev.get("transcript_artifact_id"):
+                        art_row = db.get(Artifact, uuid.UUID(str(prev["transcript_artifact_id"])))
+                        if art_row and art_row.data:
+                            transcript_dict = art_row.data
+                    if not transcript_dict:
+                        vid_row = db.execute(
+                            select(Video).where(Video.project_id == uuid.UUID(project_id))
+                        ).scalars().first()
+                        if vid_row:
+                            tr_row = db.execute(
+                                select(TranscriptModel).where(TranscriptModel.video_id == vid_row.id)
+                            ).scalars().first()
+                            if tr_row and tr_row.data:
+                                transcript_dict = tr_row.data
+            if not transcript_dict:
+                raise RuntimeError(f"Transcript artifact not found for project {project_id}")
+            transcript = Transcript.from_dict(transcript_dict)
             clips = select_clips(transcript, work_dir, user_prompt=user_prompt)
         except Exception as exc:
+
             logger.error("[select_clips] failed: %s", exc)
             _emit(project_id, "selecting_clips", 0, f"Clip selection failed: {exc}")
             _update_job_status(project_id, "select_clips", JobStatus.failed, 0, error=str(exc))
@@ -932,7 +1029,10 @@ def stage_render_clip(
         existing_render = db.execute(
             select(RenderModel).where(RenderModel.clip_id == uuid.UUID(clip_id))
         ).scalars().first()
-        if existing_render and object_exists(cfg.bucket_renders, storage_key):
+        force_rerender = bool(reframe_data.get("force_rerender", False)) if isinstance(reframe_data, dict) else False
+        if not force_rerender and existing_render and object_exists(cfg.bucket_renders, storage_key):
+
+
             logger.info("[render] Render already exists for clip %s", clip_id)
             if c and c.status != ClipStatus.done:
                 c.status = ClipStatus.done
@@ -973,7 +1073,10 @@ def stage_render_clip(
             or (brand_kit_rec.default_caption_style if brand_kit_rec else None)
         )
         saved_layout = (rs_rec.layout.value if rs_rec and rs_rec.layout else None) or reframe_data.get("layout", "vertical")
+        saved_excluded_words = (rs_rec.excluded_word_indices if rs_rec else None) or reframe_data.get("excluded_word_indices")
+        saved_word_overrides = (rs_rec.word_overrides if rs_rec else None) or reframe_data.get("word_overrides")
         brand_logo_key = brand_kit_rec.logo_key if brand_kit_rec else None
+
 
     with tempfile.TemporaryDirectory() as tmpdir:
         work_dir = Path(tmpdir)
@@ -1043,7 +1146,10 @@ def stage_render_clip(
                 clip_index=clip_index,
                 style=style,
                 watermark_path=watermark_path,
+                excluded_word_indices=saved_excluded_words,
+                word_overrides=saved_word_overrides,
             )
+
             output_path = render_res.output_path
 
             # Upload to storage
