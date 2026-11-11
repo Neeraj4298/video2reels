@@ -85,16 +85,24 @@ export default function ProjectPage() {
     );
   }
 
-  const isProcessing = project?.status === "processing" || project?.status === "pending";
+  const hasFailedJob = project?.jobs?.some((j) => j.status === "failed") ?? false;
+  const isProcessing = (project?.status === "processing" || project?.status === "pending") && !hasFailedJob;
   const isDone = project?.status === "done";
-  const isFailed = project?.status === "failed";
-  const activeJob = project?.jobs?.[0];
-  const currentProgress = liveEvent?.progress ?? activeJob?.progress ?? 0;
+  const isFailed = project?.status === "failed" || hasFailedJob;
+  const sortedJobs = project?.jobs
+    ? [...project.jobs].sort((a, b) => (b.progress ?? 0) - (a.progress ?? 0))
+    : [];
+  const activeJob =
+    project?.jobs?.find((j) => j.status === "failed") ??
+    project?.jobs?.filter((j) => j.status === "running").slice(-1)[0] ??
+    sortedJobs[0];
+  const currentProgress = liveEvent?.progress ?? sortedJobs[0]?.progress ?? activeJob?.progress ?? 0;
   const currentStageLabel = liveEvent?.stage
     ? `${liveEvent.stage} — ${liveEvent.message}`
     : activeJob?.stage
-      ? `${activeJob.stage} — Running (${activeJob.progress}%)…`
+      ? `${activeJob.stage} — ${activeJob.status === "done" ? "Done" : "Running"} (${activeJob.progress}%)…`
       : "Waiting for worker…";
+
 
   return (
     <div className="app-shell">

@@ -98,7 +98,7 @@ async def list_projects(db: AsyncSession = Depends(get_db)):
 
 @router.get("/{project_id}", response_model=ProjectDetail)
 async def get_project(project_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
-    """Get a project and its clips + jobs."""
+    """Get a project and its clips + jobs (ordered with active/latest stage first)."""
     result = await db.execute(
         select(Project)
         .where(Project.id == project_id)
@@ -110,7 +110,18 @@ async def get_project(project_id: uuid.UUID, db: AsyncSession = Depends(get_db))
     project = result.scalar_one_or_none()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    stage_order = {"ingest": 1, "audio": 2, "transcribe": 3, "select_clips": 4, "reframe": 5, "render": 6, "done": 7}
+    status_priority = {"running": 3, "failed": 2, "done": 1, "queued": 0}
+    project.jobs.sort(
+        key=lambda j: (
+            status_priority.get(j.status.value if hasattr(j.status, "value") else str(j.status), 0),
+            j.progress or 0,
+            stage_order.get(j.stage or "", 0),
+        ),
+        reverse=True,
+    )
     return project
+
 
 
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)

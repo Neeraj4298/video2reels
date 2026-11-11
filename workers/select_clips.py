@@ -303,7 +303,8 @@ def _snap_to_word_boundary(
         else:
             break
 
-    return max(0, snap_start - pad), snap_end + pad
+    return float(max(0, snap_start - pad)), float(snap_end + pad)
+
 
 
 # ── LLM callers ──────────────────────────────────────────────────────────────
@@ -957,11 +958,11 @@ def select_clips(
                 )
 
                 built.append(Clip(
-                    start=round(start, 3),
-                    end=round(end, 3),
+                    start=float(round(float(start), 3)),
+                    end=float(round(float(end), 3)),
                     hook=hook_str,
                     title=rc.get("title", ""),
-                    score=final_score,
+                    score=int(final_score),
                     score_breakdown=ScoreBreakdown(
                         hook=int(sb_raw.get("hook", 5)),
                         flow=int(sb_raw.get("flow", 5)),
@@ -975,6 +976,7 @@ def select_clips(
                     end_word_id=end_wid,
                     low_confidence=bool(rc.get("low_confidence", is_fallback)),
                 ))
+
             except (KeyError, ValueError, TypeError) as e:
                 logger.warning("[Stage 4] Skipping malformed clip: {} — {}", rc, e)
         return built

@@ -496,11 +496,12 @@ def stage_ingest(
                 "codec": video.codec,
             }
             _emit(project_id, "ingest", 20, "Video validated (cached) ✓")
-            _update_job_status(project_id, "ingest", JobStatus.running, 20)
+            _update_job_status(project_id, "ingest", JobStatus.done, 20)
             out = {"project_id": project_id, "video_storage_key": video.storage_key or video_storage_key, "meta": meta}
             if user_prompt:
                 out["user_prompt"] = user_prompt
             return out
+
 
     with tempfile.TemporaryDirectory() as tmpdir:
         work_dir = Path(tmpdir)
@@ -525,9 +526,19 @@ def stage_ingest(
                 raise ValueError(f"No source URL or uploaded video found for project {project_id}")
 
             if source_input.startswith("http://") or source_input.startswith("https://"):
-                # URL mode: ingest_video downloads with yt-dlp
-                meta = ingest_video(source_input, work_dir)
+                # URL mode: ingest_video downloads with yt-dlp and streams progress
+                def _on_ingest_progress(dl_pct: float):
+                    scaled = 5 + int(min(100.0, max(0.0, dl_pct)) * 0.13)
+                    msg = f"Downloading video ({int(dl_pct)}%)…"
+                    _emit(project_id, "ingest", scaled, msg)
+                    _update_job_status(project_id, "ingest", JobStatus.running, scaled)
+
+                try:
+                    meta = ingest_video(source_input, work_dir, progress_callback=_on_ingest_progress)
+                except TypeError:
+                    meta = ingest_video(source_input, work_dir)
                 # Store the downloaded video to MinIO so downstream stages have it
+
                 storage_key = f"{project_id}/video.mp4"
                 meta_path = getattr(meta, "path", None) if not isinstance(meta, dict) else meta.get("path")
                 downloaded_file = (
@@ -576,8 +587,9 @@ def stage_ingest(
         db.commit()
 
     _emit(project_id, "ingest", 20, "Video validated ✓")
-    _update_job_status(project_id, "ingest", JobStatus.running, 20)
+    _update_job_status(project_id, "ingest", JobStatus.done, 20)
     out = {"project_id": project_id, "video_storage_key": video_storage_key, "meta": meta_dict}
+
     if user_prompt:
         out["user_prompt"] = user_prompt
     return out
@@ -613,8 +625,9 @@ def stage_audio(self, prev: dict) -> dict:
     if object_exists(cfg.bucket_audio, audio_key):
         logger.info("[audio] Audio already exists for %s", project_id)
         _emit(project_id, "audio", 35, "Audio extracted (cached) ✓")
-        _update_job_status(project_id, "audio", JobStatus.running, 35)
+        _update_job_status(project_id, "audio", JobStatus.done, 35)
         return {**prev, "audio_key": audio_key}
+
 
     with tempfile.TemporaryDirectory() as tmpdir:
         work_dir = Path(tmpdir)
@@ -629,8 +642,9 @@ def stage_audio(self, prev: dict) -> dict:
             raise self.retry(exc=exc, countdown=_backoff(self.request.retries))
 
     _emit(project_id, "audio", 35, "Audio extracted ✓")
-    _update_job_status(project_id, "audio", JobStatus.running, 35)
+    _update_job_status(project_id, "audio", JobStatus.done, 35)
     return {**prev, "audio_key": audio_key}
+
 
 
 # ── Stage 3: Transcription ─────────────────────────────────────────────────────
@@ -669,8 +683,9 @@ def stage_transcribe(self, prev: dict) -> dict:
                 logger.info("[transcribe] Transcript already exists for %s", project_id)
                 word_count = len(tr.data.get("all_words", [])) if isinstance(tr.data, dict) else 0
                 _emit(project_id, "transcribing", 55, f"Transcribed (cached) ✓ — {word_count} words")
-                _update_job_status(project_id, "transcribe", JobStatus.running, 55)
+                _update_job_status(project_id, "transcribe", JobStatus.done, 55)
                 return {**prev, "transcript": tr.data}
+
 
     with tempfile.TemporaryDirectory() as tmpdir:
         work_dir = Path(tmpdir)
@@ -785,8 +800,9 @@ def stage_select_clips(self, prev: dict) -> dict:
                 for c in existing_clips
             ]
             _emit(project_id, "selecting_clips", 65, f"Selected {len(clips_data)} clips (cached) ✓", clips_total=len(clips_data))
-            _update_job_status(project_id, "select_clips", JobStatus.running, 65)
+            _update_job_status(project_id, "select_clips", JobStatus.done, 65)
             return {**prev, "clip_ids": clip_ids, "clips_data": clips_data}
+
 
     with tempfile.TemporaryDirectory() as tmpdir:
         work_dir = Path(tmpdir)
@@ -830,9 +846,10 @@ def stage_select_clips(self, prev: dict) -> dict:
         for clip in clips:
             db_clip = ClipModel(
                 project_id=uuid.UUID(project_id),
-                start=clip.start,
-                end=clip.end,
-                score=clip.score,
+                start=float(clip.start),
+                end=float(clip.end),
+                score=int(clip.score),
+
                 score_breakdown={
                     "hook": clip.score_breakdown.hook,
                     "flow": clip.score_breakdown.flow,
@@ -853,8 +870,9 @@ def stage_select_clips(self, prev: dict) -> dict:
         db.commit()
 
     _emit(project_id, "selecting_clips", 65, f"Selected {len(clips)} clips ✓", clips_total=len(clips))
-    _update_job_status(project_id, "select_clips", JobStatus.running, 65)
+    _update_job_status(project_id, "select_clips", JobStatus.done, 65)
     return {**prev, "clip_ids": clip_ids, "clips_data": [c.to_dict() for c in clips]}
+
 
 
 # ── Stage 5: Reframing ────────────────────────────────────────────────────────
@@ -897,8 +915,9 @@ def stage_reframe(self, prev: dict) -> dict:
         if all_present and len(all_keyframes) == len(prev["clip_ids"]):
             logger.info("[reframe] Keyframes already exist for project %s", project_id)
             _emit(project_id, "reframing", 75, "Crop paths computed (cached) ✓")
-            _update_job_status(project_id, "reframe", JobStatus.running, 75)
+            _update_job_status(project_id, "reframe", JobStatus.done, 75)
             return {**prev, "reframe_results": all_keyframes}
+
 
     with tempfile.TemporaryDirectory() as tmpdir:
         work_dir = Path(tmpdir)
@@ -941,8 +960,9 @@ def stage_reframe(self, prev: dict) -> dict:
         db.commit()
 
     _emit(project_id, "reframing", 75, "Crop paths computed ✓")
-    _update_job_status(project_id, "reframe", JobStatus.running, 75)
+    _update_job_status(project_id, "reframe", JobStatus.done, 75)
     return {**prev, "reframe_results": [
+
         r.to_dict() if hasattr(r, "to_dict") else vars(r) for r in reframe_results
     ]}
 
@@ -1210,7 +1230,7 @@ def _check_and_mark_pipeline_complete(project_id: str, total_clips: int):
                 final_status = ProjectStatus.done if done_count > 0 else ProjectStatus.failed
                 job_status = JobStatus.done if done_count > 0 else JobStatus.failed
                 _update_project_status(project_id, final_status)
-                _update_job_status(project_id, "done", job_status, 100)
+                _update_job_status(project_id, "render", job_status, 100)
                 _emit(
                     project_id,
                     "done",
@@ -1219,6 +1239,7 @@ def _check_and_mark_pipeline_complete(project_id: str, total_clips: int):
                     clips_done=done_count,
                     clips_total=total,
                 )
+
     except Exception as exc:
         logger.warning("Error checking completion for project %s: %s", project_id, exc)
 

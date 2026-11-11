@@ -114,9 +114,9 @@ class Transcript:
                         {
                             "id": w.id,
                             "w": w.text,
-                            "s": round(w.start, 3),
-                            "e": round(w.end, 3),
-                            "p": round(w.probability, 3),
+                            "s": float(round(float(w.start), 3)),
+                            "e": float(round(float(w.end), 3)),
+                            "p": float(round(float(w.probability), 3)),
                             **({"speaker": w.speaker} if w.speaker else {}),
                         }
                         for w in s.words
@@ -133,32 +133,33 @@ class Transcript:
             seg_speaker = s.get("speaker")
             words = [
                 Word(
-                    text=w["w"],
-                    start=w["s"],
-                    end=w["e"],
-                    probability=w.get("p", 1.0),
-                    id=w.get("id", ""),
+                    text=str(w["w"]),
+                    start=float(w["s"]),
+                    end=float(w["e"]),
+                    probability=float(w.get("p", 1.0)),
+                    id=str(w.get("id", "")),
                     speaker=w.get("speaker") or seg_speaker,
                 )
                 for w in s.get("words", [])
             ]
             segments.append(
                 Segment(
-                    start=s["start"],
-                    end=s["end"],
-                    text=s["text"],
+                    start=float(s["start"]),
+                    end=float(s["end"]),
+                    text=str(s["text"]),
                     words=words,
                     speaker=seg_speaker,
                 )
             )
         t = cls(
-            language=data["language"],
-            language_probability=data.get("language_probability", 1.0),
-            duration=data["duration"],
+            language=str(data["language"]),
+            language_probability=float(data.get("language_probability", 1.0)),
+            duration=float(data["duration"]),
             segments=segments,
         )
         t.ensure_word_ids()
         return t
+
 
 
     @property
@@ -373,14 +374,34 @@ def transcribe(
         )
         return t
 
-    # ── Run faster-whisper (fail loudly if unavailable) ───────────────────────
+    # ── Run faster-whisper (auto-install in container if missing, fail loudly if unavailable) ──
+    WhisperModel = None
     try:
-        from faster_whisper import WhisperModel
-    except ImportError as e:
-        raise RuntimeError(
-            f"ASR backend 'faster-whisper' is not installed ({e}). "
-            "Refusing to fabricate a synthetic transcript — install faster-whisper or provide an .srt override."
-        ) from e
+        from faster_whisper import WhisperModel as _WM
+        WhisperModel = _WM
+    except ImportError:
+        logger.warning("[Stage 3] faster-whisper not found in environment; auto-installing via uv/pip …")
+        import shutil
+        uv_bin = shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
+        if Path(uv_bin).exists():
+            subprocess.run(
+                [uv_bin, "pip", "install", "--python", sys.executable, "--quiet", "faster-whisper==1.1.1", "numpy"],
+                check=False,
+            )
+        else:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--no-cache-dir", "--quiet", "faster-whisper==1.1.1", "numpy"],
+                check=False,
+            )
+        try:
+            from faster_whisper import WhisperModel as _WM
+            WhisperModel = _WM
+        except ImportError as e:
+            raise RuntimeError(
+                f"ASR backend 'faster-whisper' is not installed ({e}). "
+                "Refusing to fabricate a synthetic transcript — install faster-whisper or provide an .srt override."
+            ) from e
+
 
     initial_prompt = None
     if custom_vocabulary:
@@ -460,17 +481,18 @@ def transcribe(
         words = []
         for w in (seg.words or []):
             words.append(Word(
-                text=w.word,
-                start=w.start,
-                end=w.end,
-                probability=w.probability,
+                text=str(w.word),
+                start=float(w.start),
+                end=float(w.end),
+                probability=float(w.probability),
             ))
         segments.append(Segment(
-            start=seg.start,
-            end=seg.end,
-            text=seg.text,
+            start=float(seg.start),
+            end=float(seg.end),
+            text=str(seg.text),
             words=words,
         ))
+
         now_t = time.time()
         if progress_callback and (now_t - last_emit >= 2.5):
             last_emit = now_t

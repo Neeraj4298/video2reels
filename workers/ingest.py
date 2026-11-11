@@ -251,8 +251,8 @@ def generate_proxy_video(source_path: Path, out_dir: Path, height: int = 720, ta
 
 # ── Core functions ────────────────────────────────────────────────────────────
 
-def download_url(url: str, out_dir: Path) -> Path:
-    """Download best quality video+audio from URL using yt-dlp."""
+def download_url(url: str, out_dir: Path, progress_callback: Optional[Any] = None) -> Path:
+    """Download best quality video+audio from URL using yt-dlp with live progress callbacks."""
     validate_source_url(url)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -272,20 +272,44 @@ def download_url(url: str, out_dir: Path) -> Path:
         "--merge-output-format", "mp4",
         "--output", template,
         "--no-playlist",
-        "--quiet",
+        "--newline",
         "--progress",
         url,
     ]
     logger.info("Downloading URL: {}", url)
-    result = _run(cmd, check=False)
-    if result.returncode != 0:
-        raise RuntimeError(f"yt-dlp failed:\n{result.stderr}")
+    if progress_callback is None:
+        result = _run(cmd, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"yt-dlp failed:\n{result.stderr}")
+    else:
+        import re
+        import time
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        last_emit = 0.0
+        output_tail: list[str] = []
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            output_tail.append(line)
+            if len(output_tail) > 40:
+                output_tail.pop(0)
+            m = re.search(r"\[download\]\s+(\d+(?:\.\d+)?)%", line)
+            now = time.time()
+            if m and (now - last_emit >= 1.5):
+                last_emit = now
+                try:
+                    progress_callback(float(m.group(1)))
+                except Exception:
+                    pass
+        rc = proc.wait()
+        if rc != 0:
+            raise RuntimeError(f"yt-dlp failed:\n{''.join(output_tail)}")
 
     # find the downloaded file
     mp4_files = sorted(out_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
     if not mp4_files:
         raise RuntimeError("yt-dlp ran but no MP4 found in output dir.")
     return mp4_files[-1]
+
 
 
 def probe_video(path: Path) -> VideoMeta:
@@ -348,13 +372,14 @@ def validate_video(meta: VideoMeta) -> None:
         raise ValueError(f"Resolution too low: {meta.width}px wide.")
 
 
-def ingest(source: str | Path, work_dir: Path) -> VideoMeta:
+def ingest(source: str | Path, work_dir: Path, progress_callback: Optional[Any] = None) -> VideoMeta:
     """
     Main entry point for Stage 1.
 
     Args:
         source: local file path OR a URL string
         work_dir: scratch directory for this project
+        progress_callback: optional callback(download_pct: float)
 
     Returns:
         VideoMeta ready for downstream stages
@@ -369,8 +394,9 @@ def ingest(source: str | Path, work_dir: Path) -> VideoMeta:
     if source_str.startswith("http://") or source_str.startswith("https://"):
         validate_source_url(source_str)
         logger.info("[Stage 1] Downloading from URL …")
-        video_path = download_url(source_str, raw_dir)
+        video_path = download_url(source_str, raw_dir, progress_callback=progress_callback)
     else:
+
 
         video_path = Path(source_str)
         if not video_path.exists() or not video_path.is_file():
